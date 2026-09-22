@@ -42,7 +42,7 @@ func (a Adapter) Adapt(body []byte, options map[string]any) ([]byte, []caddyconf
 		filename = "Caddyfile"
 	}
 
-	serverBlocks, err := Parse(filename, body)
+	serverBlocks, importedFiles, err := parseWithImports(filename, body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -58,6 +58,15 @@ func (a Adapter) Adapt(body []byte, options map[string]any) ([]byte, []caddyconf
 		warnings = append(warnings, warning)
 	}
 
+	// perform the same lint check on every file actually read via an import;
+	// the root file is reported first, followed by imported files in the
+	// order in which they were first read, each at most once
+	for _, importedFile := range importedFiles {
+		if warning, different := FormattingDifference(importedFile.absPath, importedFile.body); different {
+			warnings = append(warnings, warning)
+		}
+	}
+
 	result, err := json.Marshal(cfg)
 
 	return result, warnings, err
@@ -65,7 +74,8 @@ func (a Adapter) Adapt(body []byte, options map[string]any) ([]byte, []caddyconf
 
 // FormattingDifference returns a warning and true if the formatted version
 // is any different from the input; empty warning and false otherwise.
-// TODO: also perform this check on imported files
+// This check is performed for both the root Caddyfile and each file-based
+// import actually read during parsing.
 func FormattingDifference(filename string, body []byte) (caddyconfig.Warning, bool) {
 	// replace windows-style newlines to normalize comparison
 	normalizedBody := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))

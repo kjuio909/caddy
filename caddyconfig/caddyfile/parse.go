@@ -37,6 +37,18 @@ import (
 // Environment variables in {$ENVIRONMENT_VARIABLE} notation
 // will be replaced before parsing begins.
 func Parse(filename string, input []byte) ([]ServerBlock, error) {
+	blocks, _, err := parseWithImports(filename, input)
+	return blocks, err
+}
+
+// parseWithImports lexes and parses input into server blocks, just like
+// Parse, but also keeps track of every file-based import that is actually
+// read during parsing, in the order in which each file is first read. The
+// raw on-disk contents are preserved so callers can lint imported files
+// without having to re-expand the imports themselves. Snippet imports,
+// empty files, and unmatched glob patterns are not tracked. If the same
+// file is imported multiple times, only its first read is recorded.
+func parseWithImports(filename string, input []byte) ([]ServerBlock, []importedFile, error) {
 	// unfortunately, we must copy the input because parsing must
 	// remain a read-only operation, but we have to expand environment
 	// variables before we parse, which changes the underlying array (#4422)
@@ -45,7 +57,7 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 
 	tokens, err := allTokens(filename, inputCopy)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	p := parser{
 		Dispenser: NewDispenser(tokens),
@@ -54,7 +66,15 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 			edges: make(adjacency),
 		},
 	}
-	return p.parseAll()
+	blocks, err := p.parseAll()
+	return blocks, p.importedFilesRead, err
+}
+
+// importedFile records the original on-disk contents of a file read while
+// expanding an import, keyed by its absolute path.
+type importedFile struct {
+	absPath string
+	body    []byte
 }
 
 // allTokens lexes the entire input, but does not parse it.
@@ -117,6 +137,29 @@ type parser struct {
 	definedSnippets map[string][]Token
 	nesting         int
 	importGraph     importGraph
+
+	// importedFilesRead records the absolute paths of files actually
+	// read via file-based imports, in first-read order; seenImports
+	// backs it to ensure each file is recorded only once.
+	importedFilesRead []importedFile
+	seenImports       map[string]struct{}
+}
+
+// trackImportedFile records the raw contents of an imported file the first
+// time it is read. It takes ownership of the contents slice, which must be a
+// private copy made before environment variable expansion.
+func (p *parser) trackImportedFile(absPath string, contents []byte) {
+	if p.seenImports == nil {
+		p.seenImports = make(map[string]struct{})
+	}
+	if _, ok := p.seenImports[absPath]; ok {
+		return
+	}
+	p.seenImports[absPath] = struct{}{}
+	p.importedFilesRead = append(p.importedFilesRead, importedFile{
+		absPath: absPath,
+		body:    contents,
+	})
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -609,6 +652,11 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 		return []Token{}, nil
 	}
 
+	// snapshot the file's original contents before parsing; parsing
+	// expands environment variables in place, which mutates the slice
+	rawInput := make([]byte, len(input))
+	copy(rawInput, input)
+
 	importedTokens, err := allTokens(importFile, input)
 	if err != nil {
 		return nil, p.Errf("Could not read tokens while importing %s: %v", importFile, err)
@@ -620,6 +668,10 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 	if err != nil {
 		return nil, p.Errf("Failed to get absolute path of file: %s: %v", importFile, err)
 	}
+
+	// record the file the first time it is actually read by an import
+	p.trackImportedFile(filename, rawInput)
+
 	for i := range importedTokens {
 		importedTokens[i].File = filename
 	}
