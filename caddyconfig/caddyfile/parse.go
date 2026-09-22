@@ -37,6 +37,14 @@ import (
 // Environment variables in {$ENVIRONMENT_VARIABLE} notation
 // will be replaced before parsing begins.
 func Parse(filename string, input []byte) ([]ServerBlock, error) {
+	serverBlocks, _, err := parse(filename, input)
+	return serverBlocks, err
+}
+
+// parse is like Parse, but it also returns the raw contents of each
+// file that was read via an import directive during parsing, in the
+// order in which the files were first read.
+func parse(filename string, input []byte) ([]ServerBlock, []importedFile, error) {
 	// unfortunately, we must copy the input because parsing must
 	// remain a read-only operation, but we have to expand environment
 	// variables before we parse, which changes the underlying array (#4422)
@@ -45,7 +53,7 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 
 	tokens, err := allTokens(filename, inputCopy)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	p := parser{
 		Dispenser: NewDispenser(tokens),
@@ -54,7 +62,15 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 			edges: make(adjacency),
 		},
 	}
-	return p.parseAll()
+	serverBlocks, err := p.parseAll()
+	return serverBlocks, p.importedFiles, err
+}
+
+// importedFile associates the raw contents of a file that was read
+// via an import directive during parsing with the file's absolute path.
+type importedFile struct {
+	filename string
+	body     []byte
 }
 
 // allTokens lexes the entire input, but does not parse it.
@@ -117,6 +133,12 @@ type parser struct {
 	definedSnippets map[string][]Token
 	nesting         int
 	importGraph     importGraph
+
+	// importedFiles holds the raw contents of each file read via an
+	// import directive, in the order in which the files were first
+	// read; importedFilesSeen deduplicates them by absolute path
+	importedFiles     []importedFile
+	importedFilesSeen map[string]struct{}
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -609,6 +631,11 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 		return []Token{}, nil
 	}
 
+	// keep a copy of the raw input for later formatting checks, since
+	// tokenizing mutates the slice (environment variable replacement)
+	rawInput := make([]byte, len(input))
+	copy(rawInput, input)
+
 	importedTokens, err := allTokens(importFile, input)
 	if err != nil {
 		return nil, p.Errf("Could not read tokens while importing %s: %v", importFile, err)
@@ -622,6 +649,16 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 	}
 	for i := range importedTokens {
 		importedTokens[i].File = filename
+	}
+
+	// remember the raw contents of this file, but only the first time
+	// it is read, so each file is only reported once
+	if p.importedFilesSeen == nil {
+		p.importedFilesSeen = make(map[string]struct{})
+	}
+	if _, seen := p.importedFilesSeen[filename]; !seen {
+		p.importedFilesSeen[filename] = struct{}{}
+		p.importedFiles = append(p.importedFiles, importedFile{filename: filename, body: rawInput})
 	}
 
 	return importedTokens, nil
