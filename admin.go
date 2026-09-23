@@ -136,16 +136,29 @@ type ConfigSettings struct {
 	// config is configured to pull another config without a load_delay,
 	// as this creates a tight loop.
 	//
+	// When load_delay is zero, the config is pulled exactly once during
+	// startup and a failed pull aborts startup. When load_delay is
+	// positive, the loader becomes a self-healing hot-reload channel: it
+	// is polled on that interval forever. A nil return (or an error) is
+	// a no-op for that round; a non-nil config replaces the running
+	// config. Pull or apply failures are logged and retried on the next
+	// tick while the previously running config is kept in place, so a
+	// later valid config always recovers the channel. An unchanged
+	// config is not reapplied. Pulled configs are not persisted.
+	//
 	// EXPERIMENTAL: Subject to change.
 	LoadRaw json.RawMessage `json:"load,omitempty" caddy:"namespace=caddy.config_loaders inline_key=module"`
 
 	// The duration after which to load config. If set, config will be pulled
-	// from the config loader after this duration. A delay is required if a
-	// dynamically-loaded config is configured to load yet another config. To
-	// load configs on a regular interval, ensure this value is set the same
-	// on all loaded configs; it can also be variable if needed, and to stop
-	// the loop, simply remove dynamic config loading from the next-loaded
-	// config.
+	// from the config loader on this interval and the channel self-heals
+	// across failed pulls and failed applies until the context is canceled.
+	// A delay is required if a dynamically-loaded config is configured to
+	// load yet another config. To load configs on a regular interval, ensure
+	// this value is set the same on all loaded configs; it can also be
+	// variable if needed, and to stop the loop, simply remove dynamic config
+	// loading from the next-loaded config. If zero or unset, the config is
+	// pulled once synchronously at startup instead: a pull failure fails
+	// startup and a successful pull is not polled afterward.
 	//
 	// EXPERIMENTAL: Subject to change.
 	LoadDelay Duration `json:"load_delay,omitempty"`

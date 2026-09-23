@@ -156,6 +156,19 @@ func Load(cfgJSON []byte, forceReload bool) error {
 // the config at that path. If the hash in the ifMatchHeader doesn't match
 // the hash of the config, then an APIError with status 412 will be returned.
 func changeConfig(method, path string, input []byte, ifMatchHeader string, forceReload bool) error {
+	return changeConfigInternal(method, path, input, ifMatchHeader, forceReload, true, nil)
+}
+
+// changeConfigInternal is changeConfig with two extra knobs. allowPersist
+// should be false for configs that were pulled from a config loader (they
+// are not autosaved to disk, and a pulled config that itself pulls another
+// config without a load delay is rejected as a recursion error). abort, if
+// non-nil, is invoked while holding the exclusive config lock, right before
+// the new config replaces the running one, and lets callers detect that
+// their operation is stale (for example a config loader whose context has
+// since been canceled); a non-nil return aborts the swap and restores the
+// previous config.
+func changeConfigInternal(method, path string, input []byte, ifMatchHeader string, forceReload, allowPersist bool, abort func() error) error {
 	switch method {
 	case http.MethodGet,
 		http.MethodHead,
@@ -242,9 +255,26 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 		}
 	}
 
+	// if provided, give the caller a chance to bail out before swapping
+	// in the new config (e.g. a stale dynamic config pull)
+	if abort != nil {
+		if err := abort(); err != nil {
+			if len(rawCfgJSON) > 0 {
+				var oldCfg any
+				if err2 := json.Unmarshal(rawCfgJSON, &oldCfg); err2 != nil {
+					return fmt.Errorf("%v; additionally, restoring old config: %v", err, err2)
+				}
+				rawCfg[rawConfigKey] = oldCfg
+			} else {
+				rawCfg[rawConfigKey] = nil
+			}
+			return err
+		}
+	}
+
 	// load this new config; if it fails, we need to revert to
 	// our old representation of caddy's actual config
-	err = unsyncedDecodeAndRun(newCfg, true)
+	err = unsyncedDecodeAndRun(newCfg, allowPersist)
 	if err != nil {
 		if len(rawCfgJSON) > 0 {
 			// restore old config state to keep it consistent
@@ -614,66 +644,154 @@ func finishSettingUp(ctx Context, cfg *Config) error {
 			return fmt.Errorf("loading config loader module: %s", err)
 		}
 
-		logger := Log().Named("config_loader").With(
-			zap.String("module", val.(Module).CaddyModule().ID.Name()),
-			zap.Int("load_delay", int(cfg.Admin.Config.LoadDelay)))
+		mod, ok := val.(Module)
+		if !ok {
+			return fmt.Errorf("config loader module %T is not a caddy module", val)
+		}
+		loader, ok := val.(ConfigLoader)
+		if !ok {
+			return fmt.Errorf("config loader module %s does not implement caddy.ConfigLoader", mod.CaddyModule().ID)
+		}
 
-		runLoadedConfig := func(config []byte) error {
-			logger.Info("applying dynamically-loaded config")
-			err := changeConfig(http.MethodPost, "/"+rawConfigKey, config, "", false)
-			if errors.Is(err, errSameConfig) {
-				return err
-			}
-			if err != nil {
-				logger.Error("failed to run dynamically-loaded config", zap.Error(err))
-				return err
-			}
-			logger.Info("successfully applied dynamically-loaded config")
+		dynCfg := &dynamicConfigLoader{
+			module:    mod,
+			loader:    loader,
+			ctx:       ctx,
+			loadDelay: time.Duration(cfg.Admin.Config.LoadDelay),
+			logger: Log().Named("config_loader").With(
+				zap.String("module", mod.CaddyModule().ID.Name()),
+				zap.Duration("load_delay", time.Duration(cfg.Admin.Config.LoadDelay))),
+		}
+
+		if dynCfg.loadDelay > 0 {
+			// poll on a ticker; the loop keeps running after pull or
+			// apply failures so that a later valid config can recover
+			go dynCfg.runPolling()
 			return nil
 		}
 
-		if cfg.Admin.Config.LoadDelay > 0 {
-			go func() {
-				// the loop is here to iterate ONLY if there is an error, a no-op config load,
-				// or an unchanged config; in which case we simply wait the delay and try again
-				for {
-					timer := time.NewTimer(time.Duration(cfg.Admin.Config.LoadDelay))
-					select {
-					case <-timer.C:
-						loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
-						if err != nil {
-							logger.Error("failed loading dynamic config; will retry", zap.Error(err))
-							continue
-						}
-						if loadedConfig == nil {
-							logger.Info("dynamically-loaded config was nil; will retry")
-							continue
-						}
-						err = runLoadedConfig(loadedConfig)
-						if errors.Is(err, errSameConfig) {
-							logger.Info("dynamically-loaded config was unchanged; will retry")
-							continue
-						}
-					case <-ctx.Done():
-						if !timer.Stop() {
-							<-timer.C
-						}
-						logger.Info("stopping dynamic config loading")
-					}
-					break
-				}
-			}()
-		} else {
-			// if no LoadDelay is provided, will load config synchronously
-			loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
-			if err != nil {
-				return fmt.Errorf("loading dynamic config from %T: %v", val, err)
-			}
-			// do this in a goroutine so current config can finish being loaded; otherwise deadlock
-			go func() { _ = runLoadedConfig(loadedConfig) }()
+		// with no load delay, pull synchronously exactly once so that
+		// a failure surfaces as a startup failure
+		if err := dynCfg.pullOnce(); err != nil {
+			return fmt.Errorf("loading dynamic config from %s: %v", dynCfg.module.CaddyModule().ID, err)
 		}
 	}
 
+	return nil
+}
+
+// dynamicConfigLoader drives a single caddy.ConfigLoader module. When a
+// load delay is configured, it turns the loader into a self-healing
+// hot-reload channel: it polls the loader on that interval forever, and
+// any pull or apply failure is logged and retried on the next tick while
+// the previously running config stays in place.
+type dynamicConfigLoader struct {
+	module    Module
+	loader    ConfigLoader
+	ctx       Context
+	loadDelay time.Duration
+	logger    *zap.Logger
+}
+
+// runPolling polls the loader on a fixed interval until the loader's
+// context is canceled. Failures never stop the loop; only cancellation
+// does.
+func (d *dynamicConfigLoader) runPolling() {
+	d.logger.Info("starting dynamic config polling")
+
+	ticker := time.NewTicker(d.loadDelay)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// a pull in flight may have outlived the context; don't
+			// start a new round while we're shutting down
+			if d.ctx.Err() != nil {
+				d.logger.Info("stopping dynamic config loading")
+				return
+			}
+			d.pullAndApply()
+		case <-d.ctx.Done():
+			d.logger.Info("stopping dynamic config loading")
+			return
+		}
+	}
+}
+
+// pullAndApply performs one poll cycle: pull from the loader and, if it
+// returned a config, apply it. Pull errors, no-op (nil) results,
+// unchanged configs, and apply errors are all logged but are never
+// fatal: the running config is left untouched and polling continues.
+func (d *dynamicConfigLoader) pullAndApply() {
+	loadedConfig, err := d.loader.LoadConfig(d.ctx)
+	if err != nil {
+		// shutting down; don't log a misleading retry error, the
+		// poll loop will exit on its next select
+		if d.ctx.Err() != nil {
+			return
+		}
+		d.logger.Error("failed loading dynamic config; will retry",
+			zap.String("stage", "pull"),
+			zap.Error(err))
+		return
+	}
+	if loadedConfig == nil {
+		d.logger.Info("dynamically-loaded config was nil; will retry",
+			zap.String("stage", "pull"))
+		return
+	}
+	d.apply(loadedConfig)
+}
+
+// pullOnce performs a single synchronous pull (used when no load delay
+// is configured). A pull error is returned to the caller; a successful
+// pull is applied asynchronously so the bootstrap config can finish
+// starting without deadlocking on the config lock.
+func (d *dynamicConfigLoader) pullOnce() error {
+	loadedConfig, err := d.loader.LoadConfig(d.ctx)
+	if err != nil {
+		return err
+	}
+	if loadedConfig == nil {
+		return nil
+	}
+	// do this in a goroutine so current config can finish being loaded; otherwise deadlock
+	go d.apply(loadedConfig)
+	return nil
+}
+
+// apply replaces the running config with loadedConfig. A failed apply
+// leaves the previous config running (changeConfig restores the raw
+// state) and is reported through the returned error; callers simply
+// retry on the next poll.
+func (d *dynamicConfigLoader) apply(config []byte) error {
+	// a pull that finishes after the context was canceled must not
+	// replace the now-running config
+	if d.ctx.Err() != nil {
+		d.logger.Info("discarding dynamically-loaded config after context cancellation",
+			zap.String("stage", "apply"))
+		return d.ctx.Err()
+	}
+
+	d.logger.Info("applying dynamically-loaded config",
+		zap.String("stage", "apply"))
+
+	err := changeConfigInternal(http.MethodPost, "/"+rawConfigKey, config, "", false, false, d.ctx.Err)
+	if errors.Is(err, errSameConfig) {
+		d.logger.Info("dynamically-loaded config was unchanged; will continue polling",
+			zap.String("stage", "apply"))
+		return err
+	}
+	if err != nil {
+		d.logger.Error("failed to apply dynamically-loaded config; keeping previous config and will retry",
+			zap.String("stage", "apply"),
+			zap.Error(err))
+		return err
+	}
+
+	d.logger.Info("successfully applied dynamically-loaded config",
+		zap.String("stage", "apply"))
 	return nil
 }
 
