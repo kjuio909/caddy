@@ -37,6 +37,15 @@ import (
 // Environment variables in {$ENVIRONMENT_VARIABLE} notation
 // will be replaced before parsing begins.
 func Parse(filename string, input []byte) ([]ServerBlock, error) {
+	blocks, _, err := parse(filename, input)
+	return blocks, err
+}
+
+// parse is like Parse, but also returns the files actually expanded by
+// import directives (including glob matches and nested imports), in the
+// order in which they were first expanded. The returned file contents
+// are the raw bytes read from disk.
+func parse(filename string, input []byte) ([]ServerBlock, []importedFile, error) {
 	// unfortunately, we must copy the input because parsing must
 	// remain a read-only operation, but we have to expand environment
 	// variables before we parse, which changes the underlying array (#4422)
@@ -45,7 +54,7 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 
 	tokens, err := allTokens(filename, inputCopy)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	p := parser{
 		Dispenser: NewDispenser(tokens),
@@ -54,7 +63,15 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 			edges: make(adjacency),
 		},
 	}
-	return p.parseAll()
+	blocks, err := p.parseAll()
+	return blocks, p.importedFiles, err
+}
+
+// importedFile pairs the path of a file expanded by an import directive
+// with the raw contents that were read from disk during parsing.
+type importedFile struct {
+	filename string
+	body     []byte
 }
 
 // allTokens lexes the entire input, but does not parse it.
@@ -117,6 +134,11 @@ type parser struct {
 	definedSnippets map[string][]Token
 	nesting         int
 	importGraph     importGraph
+
+	// files expanded via import, in first-expansion order; each
+	// absolute path appears at most once per parse
+	importedFiles []importedFile
+	seenFiles     map[string]struct{}
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -609,6 +631,12 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 		return []Token{}, nil
 	}
 
+	// keep the raw file contents for post-parse checks (e.g. formatting);
+	// allTokens expands environment variables in place, which mutates the
+	// underlying array, so the check needs its own copy (issue #4422)
+	rawBody := make([]byte, len(input))
+	copy(rawBody, input)
+
 	importedTokens, err := allTokens(importFile, input)
 	if err != nil {
 		return nil, p.Errf("Could not read tokens while importing %s: %v", importFile, err)
@@ -620,6 +648,18 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 	if err != nil {
 		return nil, p.Errf("Failed to get absolute path of file: %s: %v", importFile, err)
 	}
+
+	// record the file for post-parse checks (e.g. formatting); each
+	// file is recorded only once, at its first expansion, even if it
+	// is imported again or imported with different arguments
+	if p.seenFiles == nil {
+		p.seenFiles = make(map[string]struct{})
+	}
+	if _, seen := p.seenFiles[filename]; !seen {
+		p.seenFiles[filename] = struct{}{}
+		p.importedFiles = append(p.importedFiles, importedFile{filename: filename, body: rawBody})
+	}
+
 	for i := range importedTokens {
 		importedTokens[i].File = filename
 	}
