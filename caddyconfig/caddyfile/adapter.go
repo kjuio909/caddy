@@ -23,6 +23,10 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 )
 
+// formattingWarningMessage is the lint warning emitted when a Caddyfile
+// (or an imported file) differs from the canonical formatting.
+const formattingWarningMessage = "Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies"
+
 // Adapter adapts Caddyfile to Caddy JSON.
 type Adapter struct {
 	ServerType ServerType
@@ -42,7 +46,7 @@ func (a Adapter) Adapt(body []byte, options map[string]any) ([]byte, []caddyconf
 		filename = "Caddyfile"
 	}
 
-	serverBlocks, err := Parse(filename, body)
+	serverBlocks, importedFiles, err := parse(filename, body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -58,6 +62,16 @@ func (a Adapter) Adapt(body []byte, options map[string]any) ([]byte, []caddyconf
 		warnings = append(warnings, warning)
 	}
 
+	// perform the same lint check on files actually expanded by import
+	// directives (glob matches and nested imports included); the main
+	// file's warning always comes first, imported files are reported in
+	// first-expansion order, at most once each
+	for _, imported := range importedFiles {
+		if warning, different := FormattingDifference(imported.filename, imported.body); different {
+			warnings = append(warnings, warning)
+		}
+	}
+
 	result, err := json.Marshal(cfg)
 
 	return result, warnings, err
@@ -65,7 +79,8 @@ func (a Adapter) Adapt(body []byte, options map[string]any) ([]byte, []caddyconf
 
 // FormattingDifference returns a warning and true if the formatted version
 // is any different from the input; empty warning and false otherwise.
-// TODO: also perform this check on imported files
+// In addition to the main Caddyfile, Adapt runs this check on each file
+// actually expanded by import directives.
 func FormattingDifference(filename string, body []byte) (caddyconfig.Warning, bool) {
 	// replace windows-style newlines to normalize comparison
 	normalizedBody := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
@@ -88,7 +103,7 @@ func FormattingDifference(filename string, body []byte) (caddyconfig.Warning, bo
 	return caddyconfig.Warning{
 		File:    filename,
 		Line:    line,
-		Message: "Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies",
+		Message: formattingWarningMessage,
 	}, true
 }
 

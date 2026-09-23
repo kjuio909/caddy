@@ -37,6 +37,14 @@ import (
 // Environment variables in {$ENVIRONMENT_VARIABLE} notation
 // will be replaced before parsing begins.
 func Parse(filename string, input []byte) ([]ServerBlock, error) {
+	blocks, _, err := parse(filename, input)
+	return blocks, err
+}
+
+// parse is like Parse, but also returns the files that were actually
+// expanded by `import` directives during this parse (glob matches and
+// nested imports included), in first-expansion order and de-duplicated.
+func parse(filename string, input []byte) ([]ServerBlock, []importedFile, error) {
 	// unfortunately, we must copy the input because parsing must
 	// remain a read-only operation, but we have to expand environment
 	// variables before we parse, which changes the underlying array (#4422)
@@ -45,7 +53,7 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 
 	tokens, err := allTokens(filename, inputCopy)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	p := parser{
 		Dispenser: NewDispenser(tokens),
@@ -54,7 +62,8 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 			edges: make(adjacency),
 		},
 	}
-	return p.parseAll()
+	blocks, err := p.parseAll()
+	return blocks, p.importedFiles.files, err
 }
 
 // allTokens lexes the entire input, but does not parse it.
@@ -117,6 +126,36 @@ type parser struct {
 	definedSnippets map[string][]Token
 	nesting         int
 	importGraph     importGraph
+	importedFiles   importedFiles
+}
+
+// importedFiles tracks files that are actually expanded by import
+// directives during a single parse. State is per-parse, so concurrent
+// parses never share collection state.
+type importedFiles struct {
+	files []importedFile
+	seen  map[string]struct{}
+}
+
+// importedFile is a file expanded by an import directive, along with
+// its raw on-disk contents.
+type importedFile struct {
+	filename string
+	body     []byte
+}
+
+// add records path/body the first time the file is expanded; repeated
+// imports of the same file (even with different arguments) only record
+// the first expansion.
+func (c *importedFiles) add(path string, body []byte) {
+	if c.seen == nil {
+		c.seen = make(map[string]struct{})
+	}
+	if _, ok := c.seen[path]; ok {
+		return
+	}
+	c.seen[path] = struct{}{}
+	c.files = append(c.files, importedFile{filename: path, body: body})
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -609,6 +648,12 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 		return []Token{}, nil
 	}
 
+	// lexing expands environment variables by mutating the input slice,
+	// so keep a copy of the raw on-disk contents for lint checks that
+	// must compare against the file as it was written
+	rawInput := make([]byte, len(input))
+	copy(rawInput, input)
+
 	importedTokens, err := allTokens(importFile, input)
 	if err != nil {
 		return nil, p.Errf("Could not read tokens while importing %s: %v", importFile, err)
@@ -623,6 +668,11 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 	for i := range importedTokens {
 		importedTokens[i].File = filename
 	}
+
+	// record the file actually expanded by the import directive for
+	// later lint checks (e.g. formatting); repeated imports of the same
+	// file are only recorded once, and snippets never reach here
+	p.importedFiles.add(filename, rawInput)
 
 	return importedTokens, nil
 }
