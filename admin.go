@@ -134,7 +134,9 @@ type ConfigSettings struct {
 	// when it starts. The pulled config completely replaces the current
 	// one, just like any other config load. It is an error if a pulled
 	// config is configured to pull another config without a load_delay,
-	// as this creates a tight loop.
+	// as this creates a tight loop. If load_delay is set and pulling or
+	// applying the config fails, the currently running config is left
+	// untouched and the pull is retried on the next interval.
 	//
 	// EXPERIMENTAL: Subject to change.
 	LoadRaw json.RawMessage `json:"load,omitempty" caddy:"namespace=caddy.config_loaders inline_key=module"`
@@ -1066,7 +1068,7 @@ func handleConfig(w http.ResponseWriter, r *http.Request) error {
 
 		forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
 
-		err := changeConfig(r.Method, r.URL.Path, body, r.Header.Get("If-Match"), forceReload)
+		err := changeConfig(r.Method, r.URL.Path, body, r.Header.Get("If-Match"), forceReload, true)
 		if err != nil && !errors.Is(err, errSameConfig) {
 			return err
 		}

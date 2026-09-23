@@ -133,7 +133,7 @@ func Load(cfgJSON []byte, forceReload bool) error {
 		}
 	}()
 
-	err = changeConfig(http.MethodPost, "/"+rawConfigKey, cfgJSON, "", forceReload)
+	err = changeConfig(http.MethodPost, "/"+rawConfigKey, cfgJSON, "", forceReload, true)
 	if errors.Is(err, errSameConfig) {
 		err = nil // not really an error
 	}
@@ -155,7 +155,11 @@ func Load(cfgJSON []byte, forceReload bool) error {
 // where <path> is the absolute path in the config and <hash> is the expected hash of
 // the config at that path. If the hash in the ifMatchHeader doesn't match
 // the hash of the config, then an APIError with status 412 will be returned.
-func changeConfig(method, path string, input []byte, ifMatchHeader string, forceReload bool) error {
+// If allowPersist is false, the new config will not be persisted to disk,
+// even if it is configured to; this is used for pulled (dynamically-loaded)
+// configs, which are also prevented from pulling yet another config
+// synchronously (see unsyncedDecodeAndRun).
+func changeConfig(method, path string, input []byte, ifMatchHeader string, forceReload bool, allowPersist bool) error {
 	switch method {
 	case http.MethodGet,
 		http.MethodHead,
@@ -244,7 +248,7 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 
 	// load this new config; if it fails, we need to revert to
 	// our old representation of caddy's actual config
-	err = unsyncedDecodeAndRun(newCfg, true)
+	err = unsyncedDecodeAndRun(newCfg, allowPersist)
 	if err != nil {
 		if len(rawCfgJSON) > 0 {
 			// restore old config state to keep it consistent
@@ -620,12 +624,17 @@ func finishSettingUp(ctx Context, cfg *Config) error {
 
 		runLoadedConfig := func(config []byte) error {
 			logger.Info("applying dynamically-loaded config")
-			err := changeConfig(http.MethodPost, "/"+rawConfigKey, config, "", false)
+			// pulled configs are not persisted, and they may not pull
+			// yet another config without a positive load_delay (this
+			// is enforced by unsyncedDecodeAndRun)
+			err := changeConfig(http.MethodPost, "/"+rawConfigKey, config, "", false, false)
 			if errors.Is(err, errSameConfig) {
 				return err
 			}
 			if err != nil {
-				logger.Error("failed to run dynamically-loaded config", zap.Error(err))
+				logger.Error("failed to apply dynamically-loaded config",
+					zap.String("phase", "apply"),
+					zap.Error(err))
 				return err
 			}
 			logger.Info("successfully applied dynamically-loaded config")
@@ -633,36 +642,11 @@ func finishSettingUp(ctx Context, cfg *Config) error {
 		}
 
 		if cfg.Admin.Config.LoadDelay > 0 {
-			go func() {
-				// the loop is here to iterate ONLY if there is an error, a no-op config load,
-				// or an unchanged config; in which case we simply wait the delay and try again
-				for {
-					timer := time.NewTimer(time.Duration(cfg.Admin.Config.LoadDelay))
-					select {
-					case <-timer.C:
-						loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
-						if err != nil {
-							logger.Error("failed loading dynamic config; will retry", zap.Error(err))
-							continue
-						}
-						if loadedConfig == nil {
-							logger.Info("dynamically-loaded config was nil; will retry")
-							continue
-						}
-						err = runLoadedConfig(loadedConfig)
-						if errors.Is(err, errSameConfig) {
-							logger.Info("dynamically-loaded config was unchanged; will retry")
-							continue
-						}
-					case <-ctx.Done():
-						if !timer.Stop() {
-							<-timer.C
-						}
-						logger.Info("stopping dynamic config loading")
-					}
-					break
-				}
-			}()
+			// pull and apply the config on a regular interval, recovering
+			// from pull and apply failures automatically, until a new
+			// config has been applied (if that config also pulls its own
+			// config dynamically, its own watcher takes over from there)
+			go watchConfigLoader(ctx, val.(ConfigLoader), runLoadedConfig, time.Duration(cfg.Admin.Config.LoadDelay), logger)
 		} else {
 			// if no LoadDelay is provided, will load config synchronously
 			loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
@@ -675,6 +659,60 @@ func finishSettingUp(ctx Context, cfg *Config) error {
 	}
 
 	return nil
+}
+
+// watchConfigLoader pulls a config from loader every delay and applies it
+// using apply, which replaces the running config. Pull and apply failures
+// are logged and retried on the next tick, so the running config is left
+// untouched until a valid, different config is pulled; a pulled config
+// identical to the running one is a no-op and polling simply continues.
+// The loop stops once a new config has been applied successfully, or when
+// ctx is canceled; a pull that returns after cancellation is discarded so
+// a late result cannot overwrite the running config.
+func watchConfigLoader(ctx Context, loader ConfigLoader, apply func([]byte) error, delay time.Duration, logger *zap.Logger) {
+	for {
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			logger.Info("stopping dynamic config loading")
+			return
+		}
+
+		loadedConfig, err := loader.LoadConfig(ctx)
+		if err != nil {
+			logger.Error("failed loading dynamic config; will retry",
+				zap.String("phase", "pull"),
+				zap.Error(err))
+			continue
+		}
+		if ctx.Err() != nil {
+			// the config was canceled while the pull was in flight;
+			// its late result must not overwrite the running config
+			logger.Info("stopping dynamic config loading")
+			return
+		}
+		if loadedConfig == nil {
+			logger.Info("dynamically-loaded config was nil; will retry")
+			continue
+		}
+
+		err = apply(loadedConfig)
+		if errors.Is(err, errSameConfig) {
+			logger.Info("dynamically-loaded config was unchanged; will retry")
+			continue
+		}
+		if err != nil {
+			// the apply failure has already been logged; the old
+			// config is still running, so try again next tick
+			continue
+		}
+
+		// the new config was applied successfully; if it is configured
+		// to pull its own config, the watcher started with it takes over
+		return
+	}
 }
 
 // ConfigLoader is a type that can load a Caddy config. If
