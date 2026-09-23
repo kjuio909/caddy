@@ -17,7 +17,6 @@ package intercept
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,26 +96,11 @@ var bufPool = sync.Pool{
 	},
 }
 
-// TODO: handle status code replacement
-//
 // EXPERIMENTAL: Subject to change or removal.
 type interceptedResponseHandler struct {
 	caddyhttp.ResponseRecorder
-	replacer     *caddy.Replacer
 	handler      caddyhttp.ResponseHandler
 	handlerIndex int
-	statusCode   int
-}
-
-// EXPERIMENTAL: Subject to change or removal.
-func (irh interceptedResponseHandler) WriteHeader(statusCode int) {
-	if irh.statusCode != 0 && (statusCode < 100 || statusCode >= 200) {
-		irh.ResponseRecorder.WriteHeader(irh.statusCode)
-
-		return
-	}
-
-	irh.ResponseRecorder.WriteHeader(statusCode)
 }
 
 // EXPERIMENTAL: Subject to change or removal.
@@ -131,7 +115,8 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	defer bufPool.Put(buf)
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	rec := interceptedResponseHandler{replacer: repl}
+
+	rec := interceptedResponseHandler{}
 	rec.ResponseRecorder = caddyhttp.NewResponseRecorder(w, buf, func(status int, header http.Header) bool {
 		// see if any response handler is configured for this original response
 		for i, rh := range ir.HandleResponse {
@@ -141,18 +126,11 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			rec.handler = rh
 			rec.handlerIndex = i
 
-			// if configured to only change the status code,
-			// do that then stream
-			if statusCodeStr := rh.StatusCode.String(); statusCodeStr != "" {
-				sc, err := strconv.Atoi(repl.ReplaceAll(statusCodeStr, ""))
-				if err != nil {
-					rec.statusCode = http.StatusInternalServerError
-				} else {
-					rec.statusCode = sc
-				}
-			}
-
-			return rec.statusCode == 0
+			// a matching response handler buffers the final response so it
+			// can be replaced or modified before it reaches the client;
+			// informational responses (including the 101 WebSocket upgrade)
+			// are always passed through untouched
+			return status < 100 || status > 199
 		}
 
 		return false
@@ -161,6 +139,9 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	if err := next.ServeHTTP(rec, r); err != nil {
 		return err
 	}
+	// the recorder only buffers when a response handler matched the final
+	// response; unmatched, informational (1xx), and hijacked/streamed
+	// responses (e.g. WebSocket upgrades) are passed through unchanged
 	if !rec.Buffered() {
 		return nil
 	}
@@ -176,28 +157,160 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		c.Write(zap.Int("handler", rec.handlerIndex))
 	}
 
+	// if configured to only change the status code, validate it now that
+	// intercept placeholders are available; substitute the final status
+	// code and replay the original headers and body unchanged
+	if rec.handler.Routes == nil {
+		finalStatus := rec.Status()
+		if statusCodeStr := rec.handler.StatusCode.String(); statusCodeStr != "" {
+			sc, ok := parseReplacementStatus(repl, statusCodeStr)
+			if ok {
+				finalStatus = sc
+			} else {
+				// invalid status code: keep the original headers and body,
+				// respond with an internal server error
+				ir.logger.Error("invalid replacement status code",
+					zap.String("status_code", statusCodeStr),
+					zap.Int("original_status_code", rec.Status()))
+				finalStatus = http.StatusInternalServerError
+			}
+		}
+		return writeInterceptedResponse(w, finalStatus, buf.Bytes())
+	}
+
 	// response recorder doesn't create a new copy of the original headers, they're
-	// present in the original response writer
-	// create a new recorder to see if any response body from the new handler is present,
-	// if not, use the already buffered response body
-	recorder := caddyhttp.NewResponseRecorder(w, nil, nil)
+	// present in the original response writer and shared with the new recorder.
+	// buffer the replacement response too so we can reconcile its status, headers,
+	// and body with the parts of the original response that are preserved
+	newBuf := bufPool.Get().(*bytes.Buffer)
+	newBuf.Reset()
+	defer bufPool.Put(newBuf)
+
+	recorder := caddyhttp.NewResponseRecorder(w, newBuf, func(status int, _ http.Header) bool {
+		// informational responses are not final and are passed through
+		return status < 100 || status > 199
+	})
 	if err := rec.handler.Routes.Compile(emptyHandler).ServeHTTP(recorder, r); err != nil {
 		return err
 	}
-
-	// no new response status and the status is not 0
-	if recorder.Status() == 0 && rec.Status() != 0 {
-		w.WriteHeader(rec.Status())
+	// the replacement routes streamed their response directly (an
+	// informational status such as a 101 WebSocket upgrade, or a hijacked
+	// connection); it is already on the wire, so do not write again
+	if !recorder.Buffered() {
+		return nil
 	}
 
-	// no new response body and there is some in the original response
-	// TODO: what if the new response doesn't have a body by design?
-	// see: https://github.com/caddyserver/caddy/pull/6232#issue-2235224400
-	if recorder.Size() == 0 && buf.Len() > 0 {
-		_, err := io.Copy(w, buf)
-		return err
+	finalHeader := w.Header()
+
+	// a final (non-informational) status code written by the replacement
+	// routes means they take over the response; otherwise the original
+	// status code and body are preserved and only header changes apply
+	// (the header-only and no-action cases)
+	if newStatus := recorder.Status(); newStatus >= 200 && newStatus <= 599 {
+		// the framing headers describe the original body; the replacement
+		// body is fully buffered and known-length, so drop the original
+		// Transfer-Encoding (it must not be duplicated nor trigger chunking)
+		// and recompute Content-Length from the new body
+		finalHeader.Del("Transfer-Encoding")
+
+		if bodyAllowedForStatus(newStatus) {
+			newBody := newBuf.Bytes()
+			// always send an explicit Content-Length, including for a
+			// deliberately empty replacement body such as `respond 200`;
+			// for HEAD requests the body is suppressed by the underlying
+			// ResponseWriter, but the Content-Length header is kept
+			finalHeader.Set("Content-Length", strconv.Itoa(len(newBody)))
+			w.WriteHeader(newStatus)
+			_, err := w.Write(newBody)
+			return err
+		}
+
+		// 204 and 304 responses never carry a body
+		finalHeader.Del("Content-Length")
+		w.WriteHeader(newStatus)
+		return nil
 	}
-	return nil
+
+	// no replacement response was written: keep the original status,
+	// headers (plus any the routes added), and body exactly as buffered
+	origStatus := rec.Status()
+	if origStatus < 200 || origStatus > 599 {
+		origStatus = http.StatusOK
+	}
+	if !bodyAllowedForStatus(origStatus) {
+		finalHeader.Del("Content-Length")
+		w.WriteHeader(origStatus)
+		return nil
+	}
+	origBody := buf.Bytes()
+	// the original body is fully buffered, so unless it declared its own
+	// Content-Length or used a Transfer-Encoding, send its exact length
+	// explicitly instead of letting an early WriteHeader force chunking
+	if finalHeader.Get("Content-Length") == "" && finalHeader.Get("Transfer-Encoding") == "" {
+		finalHeader.Set("Content-Length", strconv.Itoa(len(origBody)))
+	}
+	w.WriteHeader(origStatus)
+	if len(origBody) == 0 {
+		return nil
+	}
+	_, err := w.Write(origBody)
+	return err
+}
+
+// writeInterceptedResponse writes status and body to w, omitting the body
+// for status codes that do not allow one. It does not otherwise modify the
+// response headers, which are written through the shared header map.
+func writeInterceptedResponse(w http.ResponseWriter, status int, body []byte) error {
+	if !bodyAllowedForStatus(status) {
+		w.Header().Del("Content-Length")
+		w.WriteHeader(status)
+		return nil
+	}
+	// the body is fully buffered; advertise its length explicitly when the
+	// original response did not declare framing so it is not chunked
+	if w.Header().Get("Content-Length") == "" && w.Header().Get("Transfer-Encoding") == "" {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	}
+	w.WriteHeader(status)
+	if len(body) == 0 {
+		return nil
+	}
+	_, err := w.Write(body)
+	return err
+}
+
+// parseReplacementStatus expands statusCodeStr using repl and parses it as
+// an HTTP status code. It returns false if placeholder expansion fails, the
+// result is not numeric, or the code is outside the valid 200-599 range of
+// final response status codes.
+func parseReplacementStatus(repl *caddy.Replacer, statusCodeStr string) (int, bool) {
+	expanded, err := repl.ReplaceOrErr(statusCodeStr, true, true)
+	if err != nil {
+		return 0, false
+	}
+	sc, err := strconv.Atoi(expanded)
+	if err != nil {
+		return 0, false
+	}
+	if sc < 200 || sc > 599 {
+		return 0, false
+	}
+	return sc, true
+}
+
+// bodyAllowedForStatus reports whether a response with the given status
+// code is permitted to carry a body. It mirrors the logic of the same name
+// in the standard library's net/http package.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusNotModified:
+		return false
+	}
+	return true
 }
 
 // this handler does nothing because everything we need is already buffered
