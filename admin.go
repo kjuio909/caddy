@@ -372,27 +372,14 @@ func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []*url.URL {
 // Critically note that some elements and functionality of the context
 // may not be ready, e.g. storage. Tread carefully.
 func replaceLocalAdminServer(cfg *Config, ctx Context) error {
-	// always* be sure to close down the old admin endpoint
-	// as gracefully as possible, even if the new one is
-	// disabled -- careful to use reference to the current
-	// (old) admin endpoint since it will be different
-	// when the function returns
-	// (* except if the new one fails to start)
-	oldAdminServer := localAdminServer
-	var err error
-	defer func() {
-		// do the shutdown asynchronously so that any
-		// current API request gets a response; this
-		// goroutine may last a few seconds
-		if oldAdminServer != nil && err == nil {
-			go func(oldAdminServer *http.Server) {
-				err := stopAdminServer(oldAdminServer)
-				if err != nil {
-					Log().Named("admin").Error("stopping current admin endpoint", zap.Error(err))
-				}
-			}(oldAdminServer)
-		}
-	}()
+	// This function PREPARES a replacement for the local admin
+	// endpoint but does NOT publish it: the fully-constructed
+	// endpoint is staged on the config and only becomes the active
+	// endpoint (via commitLocalAdminServer) once the entire new
+	// configuration has started successfully. If the configuration
+	// fails at any later step, the staged endpoint is discarded and
+	// the currently-serving endpoint keeps running, so a failed
+	// reload never tears down a working admin API.
 
 	// set a default if admin wasn't otherwise configured
 	if cfg.Admin == nil {
@@ -401,9 +388,11 @@ func replaceLocalAdminServer(cfg *Config, ctx Context) error {
 		}
 	}
 
-	// if new admin endpoint is to be disabled, we're done
+	// if new admin endpoint is to be disabled, stage that decision
+	// and leave the current endpoint serving until commit time
 	if cfg.Admin.Disabled {
-		Log().Named("admin").Warn("admin endpoint disabled")
+		Log().Named("admin").Warn("admin endpoint will be disabled once new config is active")
+		cfg.stagedLocalAdmin = &stagedAdminServer{}
 		return nil
 	}
 
@@ -423,8 +412,7 @@ func replaceLocalAdminServer(cfg *Config, ctx Context) error {
 		return err
 	}
 
-	serverMu.Lock()
-	localAdminServer = &http.Server{
+	server := &http.Server{
 		Addr:              addr.String(), // for logging purposes only
 		Handler:           handler,
 		ReadTimeout:       10 * time.Second,
@@ -432,19 +420,21 @@ func replaceLocalAdminServer(cfg *Config, ctx Context) error {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1024 * 64,
 	}
-	serverMu.Unlock()
 
 	adminLogger := Log().Named("admin")
 	go func() {
-		serverMu.Lock()
-		server := localAdminServer
-		serverMu.Unlock()
 		if err := server.Serve(ln.(net.Listener)); !errors.Is(err, http.ErrServerClosed) {
 			adminLogger.Error("admin server shutdown for unknown reason", zap.Error(err))
 		}
 	}()
 
-	adminLogger.Info("admin endpoint started",
+	// stage the prepared endpoint; it is not reachable through the
+	// localAdminServer global until commitLocalAdminServer runs
+	cfg.stagedLocalAdmin = &stagedAdminServer{
+		server: server,
+	}
+
+	adminLogger.Info("admin endpoint prepared",
 		zap.String("address", addr.String()),
 		zap.Bool("enforce_origin", cfg.Admin.EnforceOrigin),
 		zap.Array("origins", loggableURLArray(handler.allowedOrigins)))
@@ -455,6 +445,52 @@ func replaceLocalAdminServer(cfg *Config, ctx Context) error {
 	}
 
 	return nil
+}
+
+// commitLocalAdminServer atomically publishes the local admin endpoint
+// staged for cfg, shutting down the previously-active endpoint after a
+// successful handoff. It must be called only after the whole
+// configuration has started successfully. A staged endpoint with a nil
+// server means the new configuration disables the local admin endpoint,
+// in which case the current endpoint is stopped. It is a no-op if cfg
+// did not stage a replacement at all.
+func commitLocalAdminServer(cfg *Config) {
+	staged := cfg.stagedLocalAdmin
+	if staged == nil {
+		return
+	}
+
+	// capture and detach the endpoint currently being served so we
+	// can stop it only after the replacement has been published
+	serverMu.Lock()
+	oldAdminServer := localAdminServer
+	localAdminServer = staged.server
+	serverMu.Unlock()
+
+	if oldAdminServer != nil {
+		go func(oldAdminServer *http.Server) {
+			if err := stopAdminServer(oldAdminServer); err != nil {
+				Log().Named("admin").Error("stopping previous admin endpoint", zap.Error(err))
+			}
+		}(oldAdminServer)
+	}
+
+	if staged.server == nil {
+		Log().Named("admin").Warn("admin endpoint disabled")
+	}
+}
+
+// discardStagedLocalAdminServer releases a staged local admin endpoint
+// after a configuration fails to fully start, leaving the
+// currently-serving endpoint untouched.
+func discardStagedLocalAdminServer(cfg *Config) {
+	staged := cfg.stagedLocalAdmin
+	if staged == nil || staged.server == nil {
+		return
+	}
+	if err := stopAdminServer(staged.server); err != nil {
+		Log().Named("admin").Error("stopping staged admin endpoint", zap.Error(err))
+	}
 }
 
 // manageIdentity sets up automated identity management for this server.

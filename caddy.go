@@ -92,6 +92,25 @@ type Config struct {
 
 	// fileSystems is a dict of fileSystems that will later be loaded from and added to.
 	fileSystems FileSystems
+
+	// stagedLocalAdmin is a fully-prepared replacement for the local
+	// admin endpoint that is committed atomically when this config
+	// becomes active. It is populated while the config is being
+	// provisioned (before any app is started), and is either committed
+	// by commitLocalAdminServer() once the whole config starts
+	// successfully, or discarded if the config fails, in which case
+	// the currently-serving endpoint is left untouched. A non-nil
+	// value with a nil server means the new config disables the
+	// local admin endpoint.
+	stagedLocalAdmin *stagedAdminServer
+}
+
+// stagedAdminServer is a local admin endpoint that has been fully
+// prepared (listener bound and server serving) but not yet published
+// as the active endpoint. A nil server means the new config disables
+// the local admin endpoint.
+type stagedAdminServer struct {
+	server *http.Server
 }
 
 // App is a thing that Caddy runs.
@@ -420,6 +439,10 @@ func run(newCfg *Config, start bool) (Context, error) {
 	ctx, err := provisionContext(newCfg, start)
 	if err != nil {
 		globalMetrics.configSuccess.Set(0)
+		// provisioning failed before any app started; release the
+		// prepared-but-unpublished admin endpoint (if any) and leave
+		// the currently-serving one running
+		discardStagedLocalAdminServer(newCfg)
 		return ctx, err
 	}
 
@@ -433,6 +456,10 @@ func run(newCfg *Config, start bool) (Context, error) {
 		if err != nil {
 			globalMetrics.configSuccess.Set(0)
 			ctx.cfg.cancelFunc(fmt.Errorf("configuration start error: %w", err))
+
+			// the new config never became active, so abandon its prepared
+			// admin endpoint; the previous endpoint must keep serving
+			discardStagedLocalAdminServer(newCfg)
 
 			if currentCtx.cfg != nil {
 				certmagic.Default.Storage = currentCtx.cfg.storage
@@ -473,7 +500,17 @@ func run(newCfg *Config, start bool) (Context, error) {
 	// now that the user's config is running, finish setting up anything else,
 	// such as remote admin endpoint, config loader, etc.
 	err = finishSettingUp(ctx, ctx.cfg)
-	return ctx, err
+	if err != nil {
+		return ctx, err
+	}
+
+	// the whole configuration is now fully prepared and serving; publish
+	// the prepared admin endpoint as the final, atomic step of the switch.
+	// From this point on the new version is completely active and the old
+	// endpoint (if any) is shut down. Doing this last means a failure in
+	// any earlier step leaves the previous endpoint serving untouched.
+	commitLocalAdminServer(ctx.cfg)
+	return ctx, nil
 }
 
 // provisionContext creates a new context from the given configuration and provisions
