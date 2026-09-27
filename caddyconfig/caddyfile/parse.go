@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"go.uber.org/zap"
@@ -411,14 +412,22 @@ func (p *parser) doImport(nesting int) error {
 	if p.definedSnippets != nil && p.definedSnippets[importPattern] != nil {
 		importedTokens = p.definedSnippets[importPattern]
 		if len(importedTokens) > 0 {
-			// just grab the first one
-			nodes = append(nodes, fmt.Sprintf("%s:%s", importedTokens[0].File, importedTokens[0].snippetName))
+			// just grab the first one; identify the snippet's file by its
+			// canonical path so the import graph is consistent regardless
+			// of how the file was reached
+			snippetFile, err := canonicalFilePath(importedTokens[0].File)
+			if err != nil {
+				return p.Errf("Failed to get absolute path of file: %s: %v", importedTokens[0].File, err)
+			}
+			nodes = append(nodes, fmt.Sprintf("%s:%s", snippetFile, importedTokens[0].snippetName))
 		}
 	} else {
 		// make path relative to the file of the _token_ being processed rather
 		// than current working directory (issue #867) and then use glob to get
-		// list of matching filenames
-		absFile, err := caddy.FastAbs(p.Dispenser.File())
+		// list of matching filenames; the declaring file is identified by its
+		// canonical path so that relative imports resolve against the real
+		// file even if it was reached through a symlink or a path with ".."
+		absFile, err := canonicalFilePath(p.Dispenser.File())
 		if err != nil {
 			return p.Errf("Failed to get absolute path of file: %s: %v", p.Dispenser.File(), err)
 		}
@@ -459,6 +468,12 @@ func (p *parser) doImport(nesting int) error {
 				}
 				matches = tmpMatches
 			}
+
+			// Different matches of a single glob may name the same file,
+			// e.g. through symlinks or ".." components; expand each real
+			// file only once, ordered by its canonical path so the result
+			// is stable regardless of pattern spelling or directory order
+			matches = dedupeMatchesByCanonicalPath(matches)
 		}
 
 		// collect all the imported tokens
@@ -472,7 +487,13 @@ func (p *parser) doImport(nesting int) error {
 		nodes = matches
 	}
 
-	nodeName := p.File()
+	// identify the importing file by its canonical path, so that the same
+	// file is always the same node in the import graph no matter how its
+	// path was spelled (symlinks, "..", relative vs. absolute, etc.)
+	nodeName, err := canonicalFilePath(p.File())
+	if err != nil {
+		return p.Errf("Failed to get absolute path of file: %s: %v", p.File(), err)
+	}
 	if p.Token().snippetName != "" {
 		nodeName += fmt.Sprintf(":%s", p.Token().snippetName)
 	}
@@ -581,6 +602,45 @@ func (p *parser) doImport(nesting int) error {
 	p.cursor -= len(args) + len(blockTokens) + 1
 
 	return nil
+}
+
+// canonicalFilePath returns the canonical absolute path of the file at
+// path, resolving symbolic links and cleaning the result, so that the
+// same file is identified by the same path no matter how it was spelled
+// (relative vs. absolute, ".." components, symlink aliases, and so on).
+// Path separators and case sensitivity follow the semantics of the
+// platform's file system. If the path cannot be fully resolved (for
+// example, it does not exist on disk), the cleaned absolute path is
+// returned instead.
+func canonicalFilePath(path string) (string, error) {
+	absFile, err := caddy.FastAbs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absFile); err == nil {
+		return resolved, nil
+	}
+	return absFile, nil
+}
+
+// dedupeMatchesByCanonicalPath replaces each glob match with its canonical
+// path, drops duplicates that name the same real file, and sorts the
+// result, so that expanding the matches is deterministic and each file is
+// expanded only once no matter how the matched paths were spelled.
+func dedupeMatchesByCanonicalPath(matches []string) []string {
+	canonical := make([]string, 0, len(matches))
+	for _, match := range matches {
+		canonicalMatch, err := canonicalFilePath(match)
+		if err != nil {
+			// the match came from the file system, so keep it as-is
+			// if its canonical form cannot be computed; any error will
+			// surface when the file is actually imported
+			canonicalMatch = match
+		}
+		canonical = append(canonical, canonicalMatch)
+	}
+	slices.Sort(canonical)
+	return slices.Compact(canonical)
 }
 
 // doSingleImport lexes the individual file at importFile and returns

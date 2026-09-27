@@ -17,6 +17,7 @@ package caddyfile
 import (
 	"fmt"
 	"slices"
+	"strings"
 )
 
 type adjacency map[string][]string
@@ -57,13 +58,17 @@ func (i *importGraph) addEdge(from, to string) error {
 		return fmt.Errorf("one of the nodes does not exist")
 	}
 
-	if i.willCycle(to, from) {
-		return fmt.Errorf("a cycle of imports exists between %s and %s", from, to)
+	if i.areConnected(from, to) {
+		// if connected, there's nothing to do; importing the same file
+		// again is not a cycle
+		return nil
 	}
 
-	if i.areConnected(from, to) {
-		// if connected, there's nothing to do
-		return nil
+	if path := i.findPath(to, from); path != nil {
+		// adding an edge from->to would close a loop; report the whole
+		// chain of files involved so the cycle is diagnosable
+		chain := append([]string{from}, path...)
+		return fmt.Errorf("a cycle of imports exists: %s", strings.Join(chain, " -> "))
 	}
 
 	if i.nodes == nil {
@@ -95,29 +100,38 @@ func (i *importGraph) areConnected(from, to string) bool {
 	return slices.Contains(al, to)
 }
 
-func (i *importGraph) willCycle(from, to string) bool {
-	collector := make(map[string]bool)
+// findPath returns a path from start to target through the import graph,
+// including both endpoints, or nil if no such path exists. The traversal
+// follows edges in the order they were added so the result is deterministic
+// for a given import graph.
+func (i *importGraph) findPath(start, target string) []string {
+	visited := make(map[string]bool)
+	var path []string
 
-	var visit func(string)
-	visit = func(start string) {
-		if !collector[start] {
-			collector[start] = true
-			for _, v := range i.edges[start] {
-				visit(v)
-			}
-		}
-	}
-
-	for _, v := range i.edges[from] {
-		visit(v)
-	}
-	for k := range collector {
-		if to == k {
+	var visit func(node string) bool
+	visit = func(node string) bool {
+		if node == target {
+			path = append(path, node)
 			return true
 		}
+		if visited[node] {
+			return false
+		}
+		visited[node] = true
+		path = append(path, node)
+		for _, next := range i.edges[node] {
+			if visit(next) {
+				return true
+			}
+		}
+		path = path[:len(path)-1]
+		return false
 	}
 
-	return false
+	if visit(start) {
+		return path
+	}
+	return nil
 }
 
 func (i *importGraph) exists(key string) bool {
