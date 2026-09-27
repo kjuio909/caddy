@@ -22,69 +22,92 @@ import (
 
 type adjacency map[string][]string
 
-type importGraph struct {
-	nodes map[string]struct{}
-	edges adjacency
+// graphNode pairs a node's canonical identity with a human-readable
+// label.
+//
+// The identity is used for every graph comparison: it is built from the
+// real, symlink-resolved path, folded according to the filesystem's case
+// rules, and namespaced by snippet name when applicable. The same
+// physical file reached through aliases, ".." segments, or different
+// case spellings therefore maps to one identity.
+//
+// The label is only used in diagnostics and keeps the path the way it was
+// addressed (the root file stays "Caddyfile"; imported files carry their
+// real path), so error chains are stable across machines and do not leak
+// case folding. The literal pattern that closes a loop through an alias
+// is reported separately by the parser ("while importing ...").
+type graphNode struct {
+	id    string
+	label string
 }
 
-func (i *importGraph) addNode(name string) {
-	if i.nodes == nil {
-		i.nodes = make(map[string]struct{})
+type importGraph struct {
+	// labels maps a node identity to its display label.
+	labels map[string]string
+	edges  adjacency
+}
+
+func (i *importGraph) addNode(node graphNode) {
+	if i.labels == nil {
+		i.labels = make(map[string]string)
 	}
-	if _, exists := i.nodes[name]; exists {
+	if _, exists := i.labels[node.id]; exists {
 		return
 	}
-	i.nodes[name] = struct{}{}
+	i.labels[node.id] = node.label
 }
 
-func (i *importGraph) addNodes(names []string) {
-	for _, name := range names {
-		i.addNode(name)
+func (i *importGraph) addNodes(nodes []graphNode) {
+	for _, node := range nodes {
+		i.addNode(node)
 	}
 }
 
-func (i *importGraph) removeNode(name string) {
-	delete(i.nodes, name)
+// removeNode deletes a node introduced only for an edge that failed to be
+// added. Nodes already known from an earlier edge are left untouched.
+func (i *importGraph) removeNode(node graphNode) {
+	if current, exists := i.labels[node.id]; !exists || current != node.label {
+		return
+	}
+	delete(i.labels, node.id)
+	delete(i.edges, node.id)
 }
 
-func (i *importGraph) removeNodes(names []string) {
-	for _, name := range names {
-		i.removeNode(name)
+func (i *importGraph) removeNodes(nodes []graphNode) {
+	for _, node := range nodes {
+		i.removeNode(node)
 	}
 }
 
-func (i *importGraph) addEdge(from, to string) error {
-	if !i.exists(from) || !i.exists(to) {
+func (i *importGraph) addEdge(from, to graphNode) error {
+	if !i.exists(from.id) || !i.exists(to.id) {
 		return fmt.Errorf("one of the nodes does not exist")
 	}
 
 	// A cycle is formed if `to` can already reach `from`; adding the edge
 	// would close the loop. Surface the full chain of files involved so the
 	// caller can diagnose the cycle rather than its depth.
-	if cycle := i.findPath(to, from); cycle != nil {
-		return fmt.Errorf("import cycle detected: %s", strings.Join(append(cycle, to), " -> "))
+	if cycle := i.findPath(to.id, from.id); cycle != nil {
+		chain := append(cycle, to.id)
+		return fmt.Errorf("import cycle detected: %s", strings.Join(i.labelsOf(chain), " -> "))
 	}
 
-	if i.areConnected(from, to) {
+	if i.areConnected(from.id, to.id) {
 		// if connected, there's nothing to do
 		return nil
 	}
 
-	if i.nodes == nil {
-		i.nodes = make(map[string]struct{})
-	}
 	if i.edges == nil {
 		i.edges = make(adjacency)
 	}
 
-	i.edges[from] = append(i.edges[from], to)
+	i.edges[from.id] = append(i.edges[from.id], to.id)
 	return nil
 }
 
-func (i *importGraph) addEdges(from string, tos []string) error {
+func (i *importGraph) addEdges(from graphNode, tos []graphNode) error {
 	for _, to := range tos {
-		err := i.addEdge(from, to)
-		if err != nil {
+		if err := i.addEdge(from, to); err != nil {
 			return err
 		}
 	}
@@ -100,9 +123,10 @@ func (i *importGraph) areConnected(from, to string) bool {
 }
 
 // findPath searches for any path through the graph from start to target,
-// returning the chain of node names (including both ends). It returns nil
-// when the two nodes are not connected. Edge traversal order follows edge
-// insertion order so the reported chain is stable across repeated runs.
+// returning the chain of node identities (including both ends). It
+// returns nil when the two nodes are not connected. Edge traversal order
+// follows edge insertion order so the reported chain is stable across
+// repeated runs.
 func (i *importGraph) findPath(start, target string) []string {
 	if start == target {
 		return []string{start}
@@ -136,7 +160,21 @@ func (i *importGraph) findPath(start, target string) []string {
 	return nil
 }
 
+// labelsOf maps node identities to their display labels, falling back to
+// the identity itself when a label is unavailable.
+func (i *importGraph) labelsOf(ids []string) []string {
+	labels := make([]string, len(ids))
+	for idx, id := range ids {
+		if label, ok := i.labels[id]; ok {
+			labels[idx] = label
+		} else {
+			labels[idx] = id
+		}
+	}
+	return labels
+}
+
 func (i *importGraph) exists(key string) bool {
-	_, exists := i.nodes[key]
+	_, exists := i.labels[key]
 	return exists
 }

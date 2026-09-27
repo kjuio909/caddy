@@ -51,8 +51,8 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 	p := parser{
 		Dispenser: NewDispenser(tokens),
 		importGraph: importGraph{
-			nodes: make(map[string]struct{}),
-			edges: make(adjacency),
+			labels: make(map[string]string),
+			edges:  make(adjacency),
 		},
 	}
 	return p.parseAll()
@@ -121,6 +121,9 @@ type parser struct {
 	// realPathCache memoizes canonical (symlink-resolved) paths of
 	// lexical file paths; see parser.realPath.
 	realPathCache map[string]string
+	// caseSensitivityCache memoizes the observed case sensitivity of the
+	// directories probed during this parse; see parser.realPath.
+	caseSensitivityCache map[string]bool
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -409,19 +412,19 @@ func (p *parser) doImport(nesting int) error {
 	tokensBefore := p.tokens[:p.cursor-1-len(args)-len(blockTokens)]
 	tokensAfter := p.tokens[p.cursor+1:]
 	var importedTokens []Token
-	var nodes []string
+	var nodes []graphNode
 
 	// first check snippets. That is a simple, non-recursive replacement
 	if p.definedSnippets != nil && p.definedSnippets[importPattern] != nil {
 		importedTokens = p.definedSnippets[importPattern]
 		if len(importedTokens) > 0 {
 			// just grab the first one
-			nodes = append(nodes, p.fileNodeName(importedTokens[0].File, importedTokens[0].snippetName))
+			nodes = append(nodes, p.graphNodeFor(importedTokens[0].File, importedTokens[0].snippetName))
 		}
 	} else {
-		// expand file imports (and globs) into tokens; nodes are the
-		// canonical file identities so the import graph tracks the same
-		// real file regardless of how it was addressed
+		// expand file imports (and globs) into tokens; node identities are
+		// canonical so the import graph tracks the same real file
+		// regardless of how it was addressed
 		fileTokens, fileNodes, err := p.resolveFileImports(importPattern)
 		if err != nil {
 			return err
@@ -430,10 +433,10 @@ func (p *parser) doImport(nesting int) error {
 		nodes = fileNodes
 	}
 
-	nodeName := p.graphNodeName()
-	p.importGraph.addNode(nodeName)
+	current := p.currentGraphNode()
+	p.importGraph.addNode(current)
 	p.importGraph.addNodes(nodes)
-	if err := p.importGraph.addEdges(nodeName, nodes); err != nil {
+	if err := p.importGraph.addEdges(current, nodes); err != nil {
 		p.importGraph.removeNodes(nodes)
 		// surface the offending import site along with the cycle chain so
 		// the error is diagnosable even when the loop closes through an
@@ -541,45 +544,49 @@ func (p *parser) doImport(nesting int) error {
 	return nil
 }
 
-// graphNodeName returns the import-graph node for the file currently
-// being processed. The file part is its canonical identity (see
-// realPath) so cycles are tracked by real file, and snippet tokens are
-// namespaced by snippet name so importing a snippet remains distinct
-// from importing its file.
-func (p *parser) graphNodeName() string {
-	return p.fileNodeName(p.File(), p.Token().snippetName)
+// currentGraphNode returns the import-graph node for the file currently
+// being processed.
+func (p *parser) currentGraphNode() graphNode {
+	return p.graphNodeFor(p.File(), p.Token().snippetName)
 }
 
-// fileNodeName builds the canonical graph node for a file, optionally
-// namespaced by snippet name.
-func (p *parser) fileNodeName(file, snippet string) string {
-	name := file
-	if real, err := p.realPath(file); err == nil {
-		name = real
+// graphNodeFor builds an import-graph node for a file, optionally
+// namespaced by snippet name so importing a snippet remains distinct from
+// importing its file. The node's identity is canonical (see fileIdentity)
+// for dedup and cycle tracking; its label keeps the file as it was
+// addressed for use in diagnostics.
+func (p *parser) graphNodeFor(file, snippet string) graphNode {
+	real := file
+	if resolved, err := p.realPath(file); err == nil {
+		real = resolved
 	}
+	id := p.fileIdentity(real)
+	label := file
 	if snippet != "" {
-		name += fmt.Sprintf(":%s", snippet)
+		id += ":" + snippet
+		label += ":" + snippet
 	}
-	return name
+	return graphNode{id: id, label: label}
 }
 
 // resolveFileImports expands an import pattern (a concrete path or a
-// glob) into the imported tokens. It also returns the canonical
-// identities of the imported files, for import-cycle tracking.
+// glob) into the imported tokens. It also returns graph nodes for the
+// imported files, for import-cycle tracking.
 //
-// Canonical identities are symlink-resolved, absolute, cleaned paths, so
-// the same physical file reached by different spellings (symlink
-// aliases, ".." segments, or a mix of absolute and relative paths) is
-// treated as one file. The lexical path is still used to open the file;
-// once read, its tokens are anchored to the canonical path, so a file
-// reached through a symlink resolves its own relative imports against
-// the file that declares them.
+// Node identities are symlink-resolved, absolute, cleaned paths (folded
+// according to the filesystem's case rules), so the same physical file
+// reached by different spellings (symlink aliases, ".." segments, a mix
+// of absolute and relative paths, or different case on a
+// case-insensitive volume) is treated as one file. The lexical path is
+// still used to open the file; once read, its tokens are anchored to the
+// real path, so a file reached through a symlink resolves its own
+// relative imports against the file that declares them.
 //
 // Within a single glob, a file matched more than once (for example both
 // a real file and a symlink to it) expands only once, in a deterministic
-// order based on the canonical path. Explicitly repeated imports are
+// order based on the canonical identity. Explicitly repeated imports are
 // different statements and keep their own semantics.
-func (p *parser) resolveFileImports(importPattern string) ([]Token, []string, error) {
+func (p *parser) resolveFileImports(importPattern string) ([]Token, []graphNode, error) {
 	// make path relative to the file of the _token_ being processed rather
 	// than current working directory (issue #867) and then use glob to get
 	// list of matching filenames
@@ -626,14 +633,15 @@ func (p *parser) resolveFileImports(importPattern string) ([]Token, []string, er
 	}
 
 	// A single glob statement may address the same real file more than
-	// once (a file and a symlink alias, two aliases, or equivalent
-	// spellings). Resolve each lexical match to its canonical identity,
-	// drop duplicates, and sort by canonical path so the expansion order
-	// is stable and independent of how the pattern was written or the
-	// order the filesystem returned entries in.
+	// once (a file and a symlink alias, two aliases, equivalent spellings,
+	// or case-only spellings on a case-insensitive volume). Resolve each
+	// lexical match to its canonical identity, drop duplicates, and sort
+	// by identity so the expansion order is stable and independent of how
+	// the pattern was written or the order the filesystem returned
+	// entries in.
 	type resolvedImport struct {
-		lexical string // path used to read the file and anchor its relative imports
-		real    string // canonical identity used for dedup and cycle tracking
+		lexical string    // path used to read the file and anchor its relative imports
+		node    graphNode // canonical identity for dedup and cycle tracking
 	}
 	resolved := make([]resolvedImport, 0, len(matches))
 	seen := make(map[string]struct{}, len(matches))
@@ -642,40 +650,45 @@ func (p *parser) resolveFileImports(importPattern string) ([]Token, []string, er
 		if err != nil {
 			return nil, nil, p.Errf("Could not resolve import %s: %v", match, err)
 		}
-		if _, dup := seen[realPath]; dup {
+		node := graphNode{id: p.fileIdentity(realPath), label: realPath}
+		if _, dup := seen[node.id]; dup {
 			continue
 		}
-		seen[realPath] = struct{}{}
-		resolved = append(resolved, resolvedImport{lexical: match, real: realPath})
+		seen[node.id] = struct{}{}
+		resolved = append(resolved, resolvedImport{lexical: match, node: node})
 	}
 	slices.SortFunc(resolved, func(a, b resolvedImport) int {
-		return strings.Compare(a.real, b.real)
+		return strings.Compare(a.node.id, b.node.id)
 	})
 
 	var importedTokens []Token
-	nodes := make([]string, 0, len(resolved))
+	nodes := make([]graphNode, 0, len(resolved))
 	for _, imp := range resolved {
 		newTokens, err := p.doSingleImport(imp.lexical)
 		if err != nil {
 			return nil, nil, err
 		}
 		importedTokens = append(importedTokens, newTokens...)
-		nodes = append(nodes, imp.real)
+		nodes = append(nodes, imp.node)
 	}
 
 	return importedTokens, nodes, nil
 }
 
-// realPath returns the canonical identity of a file path: absolute,
-// cleaned, and with symlinks resolved. It is used to recognize the same
-// physical file across different spellings. Results are memoized for the
-// duration of a parse so repeated adaptation over the same file tree is
-// consistent and avoids redundant filesystem work.
+// realPath returns the real path of a file: absolute, cleaned, and with
+// symlinks resolved, but without any case folding. It anchors imported
+// tokens (so relative imports resolve against the file that declares
+// them) and is used in diagnostics. Results are memoized for the duration
+// of a parse so repeated adaptation over the same file tree is consistent
+// and avoids redundant filesystem work.
+//
+// Use fileIdentity to compare whether two paths denote the same physical
+// file; identity also accounts for the filesystem's case rules.
 //
 // If a path cannot be fully evaluated (for example a dangling symlink),
-// it falls back to the cleaned absolute path; the subsequent open in
-// doSingleImport then reports the underlying I/O error using the
-// existing error paths.
+// it falls back to the cleaned absolute path; the subsequent stat/open in
+// doSingleImport then reports the underlying I/O error using the existing
+// error paths.
 func (p *parser) realPath(path string) (string, error) {
 	if p.realPathCache == nil {
 		p.realPathCache = make(map[string]string)
@@ -689,38 +702,74 @@ func (p *parser) realPath(path string) (string, error) {
 		return "", err
 	}
 
-	// Resolve symlinks to obtain the real file identity. If the path
-	// cannot be fully evaluated (a dangling symlink, a permission error,
-	// ...), fall back to the cleaned absolute path: the subsequent open
-	// in doSingleImport then reports the underlying I/O error using the
+	// Resolve symlinks to obtain the real file path. If the path cannot
+	// be fully evaluated (a dangling symlink, a permission error, ...),
+	// fall back to the cleaned absolute path: the subsequent stat/open in
+	// doSingleImport then reports the underlying I/O error using the
 	// existing error paths, so unreadable imports keep their established
 	// error categories.
 	real := abs
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
 		real = filepath.Clean(resolved)
 	}
-	if osPathCaseInsensitive {
-		real = strings.ToLower(real)
-	}
 
 	p.realPathCache[path] = real
 	return real, nil
 }
 
+// fileIdentity derives the canonical identity of a real path (as returned
+// by realPath) for equality, dedup, and cycle tracking. On a
+// case-insensitive filesystem the identity is folded to lower case so
+// spellings that differ only in case denote the same file; on a
+// case-sensitive filesystem they do not. Which one applies is observed at
+// runtime for the file's directory rather than assumed from the build
+// target, since a single host can mount both kinds of volumes. The
+// folding applies only to identity comparisons, never to displayed paths.
+func (p *parser) fileIdentity(real string) string {
+	if p.isCaseSensitive(filepath.Dir(real)) {
+		return real
+	}
+	return strings.ToLower(real)
+}
+
+// isCaseSensitive reports whether path identity under dir is
+// case-sensitive, probing the directory once per parse and reusing the
+// result.
+func (p *parser) isCaseSensitive(dir string) bool {
+	if p.caseSensitivityCache == nil {
+		p.caseSensitivityCache = make(map[string]bool)
+	}
+	if sensitive, probed := p.caseSensitivityCache[dir]; probed {
+		return sensitive
+	}
+	sensitive := probeCaseSensitive(dir)
+	p.caseSensitivityCache[dir] = sensitive
+	return sensitive
+}
+
 // doSingleImport lexes the individual file at importFile and returns
 // its tokens or an error, if any.
 func (p *parser) doSingleImport(importFile string) ([]Token, error) {
+	// Stat before opening: opening a non-regular target such as a FIFO or
+	// device node can block indefinitely or read without end. Stat follows
+	// symlinks, so a dangling alias fails as an unreadable file using the
+	// established "Could not import" error category.
+	info, err := os.Stat(importFile)
+	if err != nil {
+		return nil, p.Errf("Could not import %s: %v", importFile, err)
+	}
+	switch {
+	case info.IsDir():
+		return nil, p.Errf("Could not import %s: is a directory", importFile)
+	case !info.Mode().IsRegular():
+		return nil, p.Errf("Could not import %s: not a regular file", importFile)
+	}
+
 	file, err := os.Open(importFile)
 	if err != nil {
 		return nil, p.Errf("Could not import %s: %v", importFile, err)
 	}
 	defer file.Close()
-
-	if info, err := file.Stat(); err != nil {
-		return nil, p.Errf("Could not import %s: %v", importFile, err)
-	} else if info.IsDir() {
-		return nil, p.Errf("Could not import %s: is a directory", importFile)
-	}
 
 	input, err := io.ReadAll(file)
 	if err != nil {

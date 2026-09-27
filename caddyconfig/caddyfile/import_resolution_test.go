@@ -453,3 +453,115 @@ func TestAdapterDanglingSymlinkCategory(t *testing.T) {
 		t.Errorf("dangling symlink should keep existing I/O error category, got: %v", err)
 	}
 }
+
+// Path identity follows the filesystem's actual case rules: a relative
+// import that loops back to its declaring file through a different case
+// is a cycle on a case-insensitive volume, while on a case-sensitive
+// volume the differently-cased name is a separate (here, missing) file and
+// must not be reported as a cycle.
+func TestImportCycleThroughCaseOnlyAlias(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.conf")
+	b := filepath.Join(dir, "b.conf")
+	writeImportFile(t, a, "import b.conf\n")
+	writeImportFile(t, b, "import A.CONF\n")
+
+	_, err := parseInDir(t, dir, "import "+a+"\n")
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	msg := err.Error()
+	if probeCaseSensitive(dir) {
+		if strings.Contains(msg, "cycle") {
+			t.Errorf("on a case-sensitive filesystem A.CONF is a different file; expected a not-found error, got a cycle: %v", err)
+		}
+		if !strings.Contains(msg, "File to import not found") {
+			t.Errorf("expected the existing missing-file error category, got: %v", err)
+		}
+	} else {
+		if !strings.Contains(msg, "cycle") {
+			t.Errorf("on a case-insensitive filesystem the case-only alias must close the loop, got: %v", err)
+		}
+		if !strings.Contains(msg, "a.conf") {
+			t.Errorf("expected the chain to name a.conf, got: %v", err)
+		}
+	}
+}
+
+// On a case-sensitive filesystem two files whose names differ only in
+// case are distinct files and both expand within a glob. The inverse
+// folding on a case-insensitive filesystem cannot be exercised this way
+// (two such entries cannot coexist) and is covered by the cycle test.
+func TestImportGlobCaseOnlySpellings(t *testing.T) {
+	dir := t.TempDir()
+	if !probeCaseSensitive(dir) {
+		t.Skip("requires a case-sensitive filesystem to create case-only siblings")
+	}
+	writeImportFile(t, filepath.Join(dir, "a.conf"), site("host-a"))
+	writeImportFile(t, filepath.Join(dir, "A.conf"), site("host-A"))
+
+	blocks, err := parseInDir(t, dir, "import "+filepath.Join(dir, "*.conf")+"\n")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if got := blockKeys(blocks); strings.Join(got, ",") != "host-A,host-a" {
+		t.Errorf("expected both files expanded in path order, got %v", got)
+	}
+}
+
+// A failed adaptation leaves no state behind: immediately retrying the
+// same input yields the same error category and chain, and changing the
+// tree between attempts flips freely between failure and success without
+// any cached resolution leaking across parses.
+func TestAdapterRetryAfterFailure(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "Caddyfile")
+	cyc := filepath.Join(dir, "cyc.conf")
+	writeImportFile(t, cyc, "import alias3.conf\n")
+	symlinkOrSkip(t, cyc, filepath.Join(dir, "alias3.conf"))
+
+	var captured []ServerBlock
+	adapter := Adapter{ServerType: captureServerType{blocks: &captured}}
+	body := []byte("import " + cyc + "\n")
+
+	var firstErr string
+	for run := 0; run < 2; run++ {
+		captured = nil
+		out, _, err := adapter.Adapt(body, map[string]any{"filename": root})
+		if err == nil {
+			t.Fatalf("run %d: expected a cycle error, got nil", run)
+		}
+		if out != nil {
+			t.Errorf("run %d: expected no partial result", run)
+		}
+		if captured != nil {
+			t.Errorf("run %d: expected Setup not to run on failure", run)
+		}
+		if firstErr == "" {
+			firstErr = err.Error()
+		} else if err.Error() != firstErr {
+			t.Errorf("run %d: error changed on retry\nwant: %s\ngot:  %s", run, firstErr, err.Error())
+		}
+	}
+
+	// break the cycle: the same adaptation entry point now succeeds
+	writeImportFile(t, cyc, site("host-cyc"))
+	captured = nil
+	out, _, err := adapter.Adapt(body, map[string]any{"filename": root})
+	if err != nil {
+		t.Fatalf("expected success after breaking the cycle, got: %v", err)
+	}
+	if len(out) == 0 || len(blockKeys(captured)) != 1 {
+		t.Errorf("expected a successful expansion, got out=%d blocks=%v", len(out), blockKeys(captured))
+	}
+
+	// restore the cycle: it fails again exactly as the first time
+	writeImportFile(t, cyc, "import alias3.conf\n")
+	_, _, err = adapter.Adapt(body, map[string]any{"filename": root})
+	if err == nil {
+		t.Fatal("expected the cycle to fail again, got nil")
+	}
+	if err.Error() != firstErr {
+		t.Errorf("restored cycle should fail exactly as before\nwant: %s\ngot:  %s", firstErr, err.Error())
+	}
+}
