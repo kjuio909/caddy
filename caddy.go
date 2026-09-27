@@ -359,7 +359,10 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs without positive load_delay")
 	}
 
-	// run the new config and start all its apps
+	// run the new config and start all its apps; a swap for the admin
+	// endpoint(s) is begun here so listener conflicts and other setup
+	// failures roll back cleanly, and the new endpoint is published
+	// only by the caller once the new config is fully running
 	ctx, err := run(newCfg, true)
 	if err != nil {
 		return err
@@ -373,6 +376,12 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 
 	// Stop, Cleanup each old app
 	unsyncedStop(oldCtx)
+
+	// the new configuration is fully provisioned, started, and now the
+	// active context; publish the prepared admin endpoint(s) as the very
+	// last step of the switch so a successful load response is the
+	// transaction boundary
+	commitAdminServerSwap()
 
 	// autosave a non-nil config, if not disabled
 	if allowPersist &&
@@ -417,13 +426,23 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 // will want to use Run instead, which also
 // updates the config's raw state.
 func run(newCfg *Config, start bool) (Context, error) {
+	// begin the administration-resource transaction: provisioning
+	// replaces the local admin server, and a later finishSettingUp
+	// may replace the remote one and the identity cache. Any failure
+	// rolls these back; a fully successful run commits them.
+	resetAdminServerSwap()
+
 	ctx, err := provisionContext(newCfg, start)
 	if err != nil {
 		globalMetrics.configSuccess.Set(0)
+		rollbackAdminServerSwap()
 		return ctx, err
 	}
 
 	if !start {
+		// validation only: nothing is published, discard prepared
+		// admin resources so they don't leak
+		rollbackAdminServerSwap()
 		return ctx, nil
 	}
 
@@ -433,6 +452,10 @@ func run(newCfg *Config, start bool) (Context, error) {
 		if err != nil {
 			globalMetrics.configSuccess.Set(0)
 			ctx.cfg.cancelFunc(fmt.Errorf("configuration start error: %w", err))
+
+			// abandon any admin endpoint(s)/identity cache prepared for
+			// this failed configuration and keep serving the old ones
+			rollbackAdminServerSwap()
 
 			if currentCtx.cfg != nil {
 				certmagic.Default.Storage = currentCtx.cfg.storage

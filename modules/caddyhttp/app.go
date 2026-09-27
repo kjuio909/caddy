@@ -549,6 +549,11 @@ func (app *App) Start() error {
 					}
 					ln, ok := lnAny.(net.Listener)
 					if !ok {
+						// close the bound listener so a failed start
+						// does not leave the port occupied
+						if closer, ok := lnAny.(interface{ Close() error }); ok {
+							_ = closer.Close()
+						}
 						return fmt.Errorf("network '%s' cannot handle HTTP/1 or HTTP/2 connections", listenAddr.Network)
 					}
 

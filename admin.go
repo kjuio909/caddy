@@ -364,35 +364,212 @@ func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []*url.URL {
 	return allowed
 }
 
-// replaceLocalAdminServer replaces the running local admin server
-// according to the relevant configuration in cfg. If no configuration
-// for the admin endpoint exists in cfg, a default one is used, so
-// that there is always an admin server (unless it is explicitly
-// configured to be disabled).
+// adminServerSwap tracks the in-progress replacement of the running
+// administration endpoint(s) and identity certificate cache during a
+// configuration load. It lets a load behave like a transaction: the new
+// admin server(s) are prepared and bound alongside the old ones without
+// disturbing the old ones, and are either published all at once (commit,
+// after the rest of the configuration is fully running) or discarded
+// (rollback, if any step of the load fails).
+type adminServerSwap struct {
+	// oldLocalServer, oldRemoteServer, and oldIdentityCertCache are
+	// snapshots of the resources that were active when this load began.
+	oldLocalServer       *http.Server
+	oldRemoteServer      *http.Server
+	oldIdentityCertCache *certmagic.Cache
+
+	// newLocalServer/newRemoteServer and their bound-but-not-serving
+	// listeners are prepared for the incoming configuration. The
+	// listeners are bound early (so address conflicts fail the load
+	// before anything is published) but do not accept traffic until
+	// commit starts serving them. A nil server means that endpoint is
+	// not replaced (or is being disabled, per the matching flag).
+	newLocalServer    *http.Server
+	newLocalListener  net.Listener
+	newLocalDisabled  bool
+	newRemoteServer   *http.Server
+	newRemoteListener net.Listener
+	newRemoteDisabled bool
+
+	// newIdentityCertCache is a certificate cache created for the
+	// incoming configuration; it is not published until commit and is
+	// stopped on rollback.
+	newIdentityCertCache *certmagic.Cache
+}
+
+// resetAdminServerSwap begins a new swap, remembering the currently
+// active administration resources so they can be restored if the load
+// fails. This is not safe for concurrent use; the caller (run) is
+// serialized by rawCfgMu.
+func resetAdminServerSwap() {
+	serverMu.Lock()
+	defer serverMu.Unlock()
+	resetAdminServerSwapLocked()
+}
+
+// resetAdminServerSwapLocked is resetAdminServerSwap for callers that
+// already hold serverMu.
+func resetAdminServerSwapLocked() {
+	pendingAdminSwap = &adminServerSwap{
+		oldLocalServer:       localAdminServer,
+		oldRemoteServer:      remoteAdminServer,
+		oldIdentityCertCache: identityCertCache,
+	}
+}
+
+// commitAdminServerSwap publishes the swap: the listeners bound for the
+// new configuration start serving and replace the active server
+// pointers, while the servers that were active when the load began are
+// shut down (asynchronously, so in-flight admin requests can finish and
+// so that Shutdown drains the very load request that triggered this).
+// Identity certificate caches that were replaced are stopped.
+// It is a no-op if no swap is in progress.
+func commitAdminServerSwap() {
+	serverMu.Lock()
+	swap := pendingAdminSwap
+	pendingAdminSwap = nil
+
+	if swap == nil {
+		serverMu.Unlock()
+		return
+	}
+
+	localSrv, localLn := swap.newLocalServer, swap.newLocalListener
+	remoteSrv, remoteLn := swap.newRemoteServer, swap.newRemoteListener
+	oldLocal, oldRemote := swap.oldLocalServer, swap.oldRemoteServer
+	oldCache, newCache := swap.oldIdentityCertCache, swap.newIdentityCertCache
+
+	// publish the prepared resources as the active ones; this is the
+	// single point at which the new administration endpoint becomes
+	// observable
+	if localSrv != nil {
+		localAdminServer = localSrv
+	} else if swap.newLocalDisabled {
+		localAdminServer = nil
+	}
+	if remoteSrv != nil {
+		remoteAdminServer = remoteSrv
+	} else if swap.newRemoteDisabled {
+		remoteAdminServer = nil
+	}
+	if newCache != nil {
+		identityCertCache = newCache
+	}
+	serverMu.Unlock()
+
+	// start serving on the already-bound listeners only after the
+	// pointers are published
+	if localSrv != nil {
+		go serveAdminServer(localSrv, localLn, Log().Named("admin"))
+	}
+	if remoteSrv != nil {
+		go serveAdminServer(remoteSrv, remoteLn, Log().Named("admin.remote"))
+	}
+
+	// stop the identity cache that was replaced, if any
+	if newCache != nil && oldCache != nil {
+		go oldCache.Stop()
+	}
+
+	// shut down endpoints that the new configuration no longer serves;
+	// asynchronously so any in-flight API request (including this very
+	// load) gets a chance to respond
+	if (localSrv != nil || swap.newLocalDisabled) && oldLocal != nil {
+		go stopAdminServerLogged(oldLocal, "current admin endpoint")
+	}
+	if (remoteSrv != nil || swap.newRemoteDisabled) && oldRemote != nil {
+		go stopAdminServerLogged(oldRemote, "current secure admin endpoint")
+	}
+}
+
+// serveAdminServer serves srv on ln, logging unexpected shutdowns.
+func serveAdminServer(srv *http.Server, ln net.Listener, logger *zap.Logger) {
+	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("admin server shutdown for unknown reason", zap.Error(err))
+	}
+}
+
+// rollbackAdminServerSwap aborts the swap: the listeners bound for the
+// failed configuration are closed without ever having served, and any
+// identity cache created for it is stopped, so no port, goroutine, or
+// background task is left behind. The resources active when the load
+// began were never unpublished and continue serving.
+// It is a no-op if no swap is in progress.
+func rollbackAdminServerSwap() {
+	serverMu.Lock()
+	swap := pendingAdminSwap
+	pendingAdminSwap = nil
+	if swap == nil {
+		serverMu.Unlock()
+		return
+	}
+
+	// the local/remote server pointers were never changed before
+	// commit; restore the identity cache if a new one was staged and
+	// published to the global early (the remote endpoint preparation
+	// needs it), then snapshot the staged resources to discard outside
+	// the lock
+	if swap.newIdentityCertCache != nil {
+		identityCertCache = swap.oldIdentityCertCache
+	}
+	localLn := swap.newLocalListener
+	remoteLn := swap.newRemoteListener
+	newCache := swap.newIdentityCertCache
+	serverMu.Unlock()
+
+	if localLn != nil {
+		_ = localLn.Close()
+	}
+	if remoteLn != nil {
+		_ = remoteLn.Close()
+	}
+	if newCache != nil {
+		go newCache.Stop()
+	}
+}
+
+// stopAdminServerLogged stops srv, logging any error. It exists so the
+// asynchronous shutdowns above share one code path.
+func stopAdminServerLogged(srv *http.Server, what string) {
+	if err := stopAdminServer(srv); err != nil {
+		Log().Named("admin").Error(fmt.Sprintf("stopping %s", what), zap.Error(err))
+	}
+}
+
+// replaceLocalAdminServer prepares a new local admin server according
+// to the relevant configuration in cfg. If no configuration for the
+// admin endpoint exists in cfg, a default one is used, so that there is
+// always an admin server (unless it is explicitly configured to be
+// disabled).
+//
+// During a config load (a swap started by run), the new listener is
+// bound early -- so listen-address conflicts fail the load while the
+// old endpoint is still serving -- but it does not accept traffic and
+// the active server pointer is not changed until commitAdminServerSwap.
+// If the load fails, rollbackAdminServerSwap closes the bound listener
+// without it ever having served.
 // Critically note that some elements and functionality of the context
 // may not be ready, e.g. storage. Tread carefully.
-func replaceLocalAdminServer(cfg *Config, ctx Context) error {
-	// always* be sure to close down the old admin endpoint
-	// as gracefully as possible, even if the new one is
-	// disabled -- careful to use reference to the current
-	// (old) admin endpoint since it will be different
-	// when the function returns
-	// (* except if the new one fails to start)
-	oldAdminServer := localAdminServer
-	var err error
-	defer func() {
-		// do the shutdown asynchronously so that any
-		// current API request gets a response; this
-		// goroutine may last a few seconds
-		if oldAdminServer != nil && err == nil {
-			go func(oldAdminServer *http.Server) {
-				err := stopAdminServer(oldAdminServer)
-				if err != nil {
-					Log().Named("admin").Error("stopping current admin endpoint", zap.Error(err))
-				}
-			}(oldAdminServer)
-		}
-	}()
+func replaceLocalAdminServer(cfg *Config, ctx Context) (retErr error) {
+	// direct (non-reload) callers get an immediate, self-contained swap
+	serverMu.Lock()
+	ownSwap := pendingAdminSwap == nil
+	if ownSwap {
+		resetAdminServerSwapLocked()
+	}
+	serverMu.Unlock()
+	if ownSwap {
+		defer func() {
+			if retErr != nil {
+				rollbackAdminServerSwap()
+			} else {
+				commitAdminServerSwap()
+			}
+		}()
+	}
+	serverMu.Lock()
+	swap := pendingAdminSwap
+	serverMu.Unlock()
 
 	// set a default if admin wasn't otherwise configured
 	if cfg.Admin == nil {
@@ -401,9 +578,13 @@ func replaceLocalAdminServer(cfg *Config, ctx Context) error {
 		}
 	}
 
-	// if new admin endpoint is to be disabled, we're done
+	// if the new admin endpoint is to be disabled, just record that
+	// fact; the currently-running endpoint keeps serving until commit
 	if cfg.Admin.Disabled {
 		Log().Named("admin").Warn("admin endpoint disabled")
+		serverMu.Lock()
+		swap.newLocalDisabled = true
+		serverMu.Unlock()
 		return nil
 	}
 
@@ -418,13 +599,21 @@ func replaceLocalAdminServer(cfg *Config, ctx Context) error {
 		return err
 	}
 
-	ln, err := addr.Listen(context.TODO(), 0, net.ListenConfig{})
+	// bind now so a conflicting listen address fails the load before
+	// anything is published; the listener does not serve until commit
+	lnAny, err := addr.Listen(context.TODO(), 0, net.ListenConfig{})
 	if err != nil {
 		return err
 	}
+	ln, ok := lnAny.(net.Listener)
+	if !ok {
+		if closer, ok := lnAny.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+		return fmt.Errorf("admin endpoint listener is not a stream listener")
+	}
 
-	serverMu.Lock()
-	localAdminServer = &http.Server{
+	newServer := &http.Server{
 		Addr:              addr.String(), // for logging purposes only
 		Handler:           handler,
 		ReadTimeout:       10 * time.Second,
@@ -432,19 +621,26 @@ func replaceLocalAdminServer(cfg *Config, ctx Context) error {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1024 * 64,
 	}
-	serverMu.Unlock()
 
 	adminLogger := Log().Named("admin")
-	go func() {
-		serverMu.Lock()
-		server := localAdminServer
-		serverMu.Unlock()
-		if err := server.Serve(ln.(net.Listener)); !errors.Is(err, http.ErrServerClosed) {
-			adminLogger.Error("admin server shutdown for unknown reason", zap.Error(err))
+
+	// if preparation fails after this point, close the bound listener
+	// so a failed load cannot leak a port; on success ownership moves
+	// to the swap (commit starts serving it, rollback closes it)
+	prepared := false
+	defer func() {
+		if !prepared {
+			_ = ln.Close()
 		}
 	}()
 
-	adminLogger.Info("admin endpoint started",
+	serverMu.Lock()
+	swap.newLocalServer = newServer
+	swap.newLocalListener = ln
+	serverMu.Unlock()
+	prepared = true
+
+	adminLogger.Info("admin endpoint prepared",
 		zap.String("address", addr.String()),
 		zap.Bool("enforce_origin", cfg.Admin.EnforceOrigin),
 		zap.Array("origins", loggableURLArray(handler.allowedOrigins)))
@@ -482,11 +678,9 @@ func manageIdentity(ctx Context, cfg *Config) error {
 		}
 	}
 
-	// we'll make a new cache when we make the CertMagic config, so stop any previous cache
-	if identityCertCache != nil {
-		identityCertCache.Stop()
-	}
-
+	// we'll make a new cache when we make the CertMagic config; the new
+	// cache is staged in the pending swap and only published at commit,
+	// so the previous cache keeps serving the old config meanwhile
 	logger := Log().Named("admin.identity")
 	cmCfg := cfg.Admin.Identity.certmagicConfig(logger, true)
 
@@ -504,29 +698,42 @@ func manageIdentity(ctx Context, cfg *Config) error {
 	return cmCfg.ManageAsync(ctx, cfg.Admin.Identity.Identifiers)
 }
 
-// replaceRemoteAdminServer replaces the running remote admin server
-// according to the relevant configuration in cfg. It stops any previous
-// remote admin server and only starts a new one if configured.
-func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
-	if cfg == nil {
-		return nil
+// replaceRemoteAdminServer prepares a remote admin server according to
+// the relevant configuration in cfg. As with the local endpoint, the
+// new server is bound and started without replacing the currently
+// running one, which keeps serving until commitAdminServerSwap runs; a
+// failed load is undone by rollbackAdminServerSwap. If the new
+// configuration does not enable remote administration, the currently
+// running remote endpoint is scheduled for shutdown at commit.
+func replaceRemoteAdminServer(ctx Context, cfg *Config) (retErr error) {
+	// direct (non-reload) callers get an immediate, self-contained swap
+	serverMu.Lock()
+	ownSwap := pendingAdminSwap == nil
+	if ownSwap {
+		resetAdminServerSwapLocked()
 	}
+	serverMu.Unlock()
+	if ownSwap {
+		defer func() {
+			if retErr != nil {
+				rollbackAdminServerSwap()
+			} else {
+				commitAdminServerSwap()
+			}
+		}()
+	}
+	serverMu.Lock()
+	swap := pendingAdminSwap
+	serverMu.Unlock()
 
 	remoteLogger := Log().Named("admin.remote")
 
-	oldAdminServer := remoteAdminServer
-	defer func() {
-		if oldAdminServer != nil {
-			go func(oldAdminServer *http.Server) {
-				err := stopAdminServer(oldAdminServer)
-				if err != nil {
-					Log().Named("admin").Error("stopping current secure admin endpoint", zap.Error(err))
-				}
-			}(oldAdminServer)
-		}
-	}()
-
-	if cfg.Admin == nil || cfg.Admin.Remote == nil {
+	// no remote admin in the new config: schedule removal of any
+	// existing endpoint at commit; until then it keeps serving
+	if cfg == nil || cfg.Admin == nil || cfg.Admin.Remote == nil {
+		serverMu.Lock()
+		swap.newRemoteDisabled = true
+		serverMu.Unlock()
 		return nil
 	}
 
@@ -572,9 +779,7 @@ func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
 		return err
 	}
 
-	serverMu.Lock()
-	// create secure HTTP server
-	remoteAdminServer = &http.Server{
+	newServer := &http.Server{
 		Addr:              addr.String(), // for logging purposes only
 		Handler:           handler,
 		TLSConfig:         tlsConfig,
@@ -584,26 +789,37 @@ func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
 		MaxHeaderBytes:    1024 * 64,
 		ErrorLog:          serverLogger,
 	}
-	serverMu.Unlock()
 
-	// start listener
+	// bind now so a conflicting listen address fails the load before
+	// anything is published; the listener does not serve until commit
 	lnAny, err := addr.Listen(ctx, 0, net.ListenConfig{})
 	if err != nil {
 		return err
 	}
-	ln := lnAny.(net.Listener)
-	ln = tls.NewListener(ln, tlsConfig)
+	rawLn, ok := lnAny.(net.Listener)
+	if !ok {
+		_ = lnAny.(interface{ Close() error }).Close()
+		return fmt.Errorf("admin remote endpoint listener is not a stream listener")
+	}
+	tlsLn := tls.NewListener(rawLn, tlsConfig)
 
-	go func() {
-		serverMu.Lock()
-		server := remoteAdminServer
-		serverMu.Unlock()
-		if err := server.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
-			remoteLogger.Error("admin remote server shutdown for unknown reason", zap.Error(err))
+	// if preparation fails after this point, close the bound listener
+	// so a failed load cannot leak a port; on success ownership moves
+	// to the swap (commit starts serving it, rollback closes it)
+	prepared := false
+	defer func() {
+		if !prepared {
+			_ = tlsLn.Close()
 		}
 	}()
 
-	remoteLogger.Info("secure admin remote control endpoint started",
+	serverMu.Lock()
+	swap.newRemoteServer = newServer
+	swap.newRemoteListener = tlsLn
+	serverMu.Unlock()
+	prepared = true
+
+	remoteLogger.Info("secure admin remote control endpoint prepared",
 		zap.String("address", addr.String()))
 
 	return nil
@@ -633,12 +849,22 @@ func (ident *IdentityConfig) certmagicConfig(logger *zap.Logger, makeCache bool)
 		Issuers: ident.issuers,
 	}
 	if makeCache {
-		identityCertCache = certmagic.NewCache(certmagic.CacheOptions{
+		newCache := certmagic.NewCache(certmagic.CacheOptions{
 			GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
 				return cmCfg, nil
 			},
 			Logger: logger.Named("cache"),
 		})
+		identityCertCache = newCache
+
+		// during a transactional config load, remember the new cache so
+		// it is stopped on rollback and the previous cache is restored;
+		// outside of a load (e.g. tests) the global is replaced directly
+		serverMu.Lock()
+		if pendingAdminSwap != nil {
+			pendingAdminSwap.newIdentityCertCache = newCache
+		}
+		serverMu.Unlock()
 	}
 	cmCfg = certmagic.New(identityCertCache, template)
 	return cmCfg
@@ -1482,4 +1708,11 @@ var (
 	serverMu                            sync.Mutex
 	localAdminServer, remoteAdminServer *http.Server
 	identityCertCache                   *certmagic.Cache
+
+	// pendingAdminSwap holds the in-progress administration resource
+	// replacement for the config currently being loaded; it is created
+	// by resetAdminServerSwap and consumed exactly once by either
+	// commitAdminServerSwap (successful load) or rollbackAdminServerSwap
+	// (failed load). All access must hold serverMu (unless otherwise noted).
+	pendingAdminSwap *adminServerSwap
 )
