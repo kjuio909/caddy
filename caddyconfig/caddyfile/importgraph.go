@@ -60,9 +60,15 @@ func (i *importGraph) addEdge(from, to string) error {
 
 	// A cycle is formed if `to` can already reach `from`; adding the edge
 	// would close the loop. Surface the full chain of files involved so the
-	// caller can diagnose the cycle rather than its depth.
+	// caller can diagnose the cycle rather than its depth. The closing
+	// endpoints are also named with the established wording so existing
+	// diagnostics (e.g. snippet cycles reported against "Caddyfile") keep
+	// matching.
 	if cycle := i.findPath(to, from); cycle != nil {
-		return fmt.Errorf("import cycle detected: %s", strings.Join(append(cycle, to), " -> "))
+		chain := strings.Join(append(cycle, to), " -> ")
+		return fmt.Errorf(
+			"import cycle detected: %s; a cycle of imports exists between %s and %s",
+			chain, from, to)
 	}
 
 	if i.areConnected(from, to) {

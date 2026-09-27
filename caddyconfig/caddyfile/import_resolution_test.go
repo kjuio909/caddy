@@ -453,3 +453,160 @@ func TestAdapterDanglingSymlinkCategory(t *testing.T) {
 		t.Errorf("dangling symlink should keep existing I/O error category, got: %v", err)
 	}
 }
+
+// fsCaseInsensitive reports whether dir folds file-name case, observed from
+// the live filesystem rather than from the target operating system. A
+// default APFS or NTFS/FAT volume folds case even when the kernel is Unix-like.
+func fsCaseInsensitive(t *testing.T, dir string) bool {
+	t.Helper()
+	probeName := ".case_probe_abc"
+	probe := filepath.Join(dir, probeName)
+	writeImportFile(t, probe, "")
+	info, err := os.Stat(probe)
+	if err != nil {
+		t.Skipf("cannot probe filesystem case rules: %v", err)
+	}
+	flipped, err := os.Stat(filepath.Join(dir, strings.ToUpper(probeName)))
+	if err != nil {
+		return false
+	}
+	return os.SameFile(info, flipped)
+}
+
+// On a case-insensitive volume, aliases differing only in case (here a symlink
+// whose target is spelled with different case) still denote the same real
+// file: a single glob must expand it once and must not depend on a fixed
+// per-OS folding rule.
+func TestImportGlobDeduplicatesCaseOnlyAlias(t *testing.T) {
+	dir := t.TempDir()
+	if !fsCaseInsensitive(t, dir) {
+		t.Skip("requires a case-insensitive filesystem")
+	}
+	writeImportFile(t, filepath.Join(dir, "real", "a.conf"), site("host-a"))
+	writeImportFile(t, filepath.Join(dir, "m.conf"), site("host-m"))
+	// the target is spelled in a case that does not exist on disk
+	symlinkOrSkip(t, filepath.Join(dir, "REAL", "A.CONF"), filepath.Join(dir, "z-link.conf"))
+
+	blocks, err := parseInDir(t, dir, "import "+filepath.Join(dir, "*.conf")+"\n")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	got := blockKeys(blocks)
+	// the alias canonicalizes to real/a.conf, which sorts after m.conf;
+	// the important assertion is that the alias adds no extra expansion
+	want := []string{"host-m", "host-a"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("expected %v (case alias collapsed, canonical order), got %v", want, got)
+	}
+}
+
+// A cycle closed through a case-only alias on a case-insensitive volume must
+// be detected and report the same chain on immediate retries.
+func TestImportCycleThroughCaseOnlyAlias(t *testing.T) {
+	dir := t.TempDir()
+	if !fsCaseInsensitive(t, dir) {
+		t.Skip("requires a case-insensitive filesystem")
+	}
+	a := filepath.Join(dir, "a.conf")
+	writeImportFile(t, a, "import link.conf\n"+site("host-a"))
+	// the alias points at the same file using a different-case spelling
+	symlinkOrSkip(t, filepath.Join(dir, "A.CONF"), filepath.Join(dir, "link.conf"))
+
+	body := []byte("import " + a + "\n")
+	var firstErr string
+	for run := 0; run < 2; run++ {
+		_, err := Parse(filepath.Join(dir, "Caddyfile"), body)
+		if err == nil {
+			t.Fatalf("run %d: expected a cycle error, got nil", run)
+		}
+		if run == 0 {
+			firstErr = err.Error()
+			continue
+		}
+		if err.Error() != firstErr {
+			t.Errorf("expected identical error chain on retry\nwant: %s\ngot:  %s", firstErr, err.Error())
+		}
+	}
+	if !strings.Contains(firstErr, "cycle") ||
+		!strings.Contains(firstErr, "a.conf") ||
+		!strings.Contains(firstErr, "link.conf") {
+		t.Errorf("expected a cycle chain naming a.conf and the link, got: %s", firstErr)
+	}
+}
+
+// On a case-sensitive volume, two files whose names differ only in case are
+// genuinely different files and must both expand; case folding must never be
+// forced by the implementation.
+func TestImportCaseDistinctOnCaseSensitiveFS(t *testing.T) {
+	dir := t.TempDir()
+	if fsCaseInsensitive(t, dir) {
+		t.Skip("requires a case-sensitive filesystem")
+	}
+	writeImportFile(t, filepath.Join(dir, "CASE.conf"), site("host-upper"))
+	writeImportFile(t, filepath.Join(dir, "case.conf"), site("host-lower"))
+
+	blocks, err := parseInDir(t, dir, "import "+filepath.Join(dir, "*.conf")+"\n")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	got := blockKeys(blocks)
+	if len(got) != 2 {
+		t.Fatalf("expected both case-distinct files to expand, got %v", got)
+	}
+	upper := strings.Join(got, ",")
+	if upper != "host-upper,host-lower" && upper != "host-lower,host-upper" {
+		t.Errorf("expected both hosts in a stable order, got %v", got)
+	}
+}
+
+// A failed adaptation leaves no state that changes later adaptations:
+// failing, then succeeding, then failing again through the same Adapter
+// yields the same error category and chain both times.
+func TestAdapterFailureIsStateless(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "Caddyfile")
+	writeImportFile(t, filepath.Join(dir, "a.conf"), site("host-a"))
+	writeImportFile(t, filepath.Join(dir, "cyc.conf"), "import cyc-link.conf\n")
+	symlinkOrSkip(t, filepath.Join(dir, "cyc.conf"), filepath.Join(dir, "cyc-link.conf"))
+
+	var captured []ServerBlock
+	adapter := Adapter{ServerType: captureServerType{blocks: &captured}}
+	failBody := []byte("import " + filepath.Join(dir, "cyc.conf") + "\n")
+	goodBody := []byte("import " + filepath.Join(dir, "a.conf") + "\n")
+
+	out, _, err := adapter.Adapt(failBody, map[string]any{"filename": root})
+	if err == nil {
+		t.Fatal("expected the first adaptation to fail, got nil")
+	}
+	if out != nil {
+		t.Errorf("expected no partial output on failure, got %d bytes", len(out))
+	}
+	if captured != nil {
+		t.Error("expected Setup not to run on a failed adaptation")
+	}
+	firstErr := err.Error()
+
+	if out, _, err := adapter.Adapt(goodBody, map[string]any{"filename": root}); err != nil {
+		t.Fatalf("expected a later adaptation to succeed, got: %v", err)
+	} else if len(out) == 0 {
+		t.Error("expected non-empty output from the successful adaptation")
+	}
+	if got := blockKeys(captured); len(got) != 1 || got[0] != "host-a" {
+		t.Errorf("expected [host-a] after recovery, got %v", got)
+	}
+
+	captured = nil
+	out, _, err = adapter.Adapt(failBody, map[string]any{"filename": root})
+	if err == nil {
+		t.Fatal("expected the repeated failure to fail again, got nil")
+	}
+	if out != nil {
+		t.Errorf("expected no partial output on the repeated failure, got %d bytes", len(out))
+	}
+	if captured != nil {
+		t.Error("expected Setup not to run on the repeated failure")
+	}
+	if err.Error() != firstErr {
+		t.Errorf("expected the identical error chain after success\nwant: %s\ngot:  %s", firstErr, err.Error())
+	}
+}

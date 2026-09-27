@@ -121,6 +121,9 @@ type parser struct {
 	// realPathCache memoizes canonical (symlink-resolved) paths of
 	// lexical file paths; see parser.realPath.
 	realPathCache map[string]string
+	// dirEntriesCache memoizes entry names of a directory for the
+	// duration of a parse; see parser.canonicalCasePath.
+	dirEntriesCache map[string][]string
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -542,21 +545,21 @@ func (p *parser) doImport(nesting int) error {
 }
 
 // graphNodeName returns the import-graph node for the file currently
-// being processed. The file part is its canonical identity (see
-// realPath) so cycles are tracked by real file, and snippet tokens are
-// namespaced by snippet name so importing a snippet remains distinct
-// from importing its file.
+// being processed. Tokens belonging to a file read from disk carry its
+// canonical identity in File (set in doSingleImport), so the same real
+// file reached through an alias or ".." maps to one node. The virtual
+// root of an inline adaptation ("Caddyfile") keeps its lexical name.
+// Snippet tokens are namespaced by snippet name so importing a snippet
+// remains distinct from importing its file.
 func (p *parser) graphNodeName() string {
 	return p.fileNodeName(p.File(), p.Token().snippetName)
 }
 
-// fileNodeName builds the canonical graph node for a file, optionally
-// namespaced by snippet name.
+// fileNodeName builds the graph node for a file, optionally namespaced
+// by snippet name. The file argument is expected to already be the
+// canonical identity produced when the file was read.
 func (p *parser) fileNodeName(file, snippet string) string {
 	name := file
-	if real, err := p.realPath(file); err == nil {
-		name = real
-	}
 	if snippet != "" {
 		name += fmt.Sprintf(":%s", snippet)
 	}
@@ -667,10 +670,17 @@ func (p *parser) resolveFileImports(importPattern string) ([]Token, []string, er
 }
 
 // realPath returns the canonical identity of a file path: absolute,
-// cleaned, and with symlinks resolved. It is used to recognize the same
-// physical file across different spellings. Results are memoized for the
-// duration of a parse so repeated adaptation over the same file tree is
-// consistent and avoids redundant filesystem work.
+// cleaned, symlinks resolved, and spelled as the names exist on disk.
+// It is used to recognize the same physical file across different
+// spellings. Results are memoized for the duration of a parse so
+// repeated adaptation over the same file tree is consistent and avoids
+// redundant filesystem work.
+//
+// Case rules are observed from the running filesystem rather than from
+// the target operating system: a case-insensitive volume (such as a
+// default APFS or FAT mount on a Unix-like system) folds names that
+// differ only in case, while a case-sensitive volume does not. See
+// canonicalCasePath.
 //
 // If a path cannot be fully evaluated (for example a dangling symlink),
 // it falls back to the cleaned absolute path; the subsequent open in
@@ -699,28 +709,131 @@ func (p *parser) realPath(path string) (string, error) {
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
 		real = filepath.Clean(resolved)
 	}
-	if osPathCaseInsensitive {
-		real = strings.ToLower(real)
-	}
+
+	// Fold the spelling the way the live filesystem does, so names
+	// differing only in case on a case-insensitive volume map to one
+	// identity (and are left apart on a case-sensitive one).
+	real = p.canonicalCasePath(real)
 
 	p.realPathCache[path] = real
 	return real, nil
 }
 
+// canonicalCasePath rewrites each component of an absolute, symlink-resolved
+// path to the spelling it actually has on disk when the containing directory
+// folds name case.
+//
+// Whether two names differing only in case denote the same file is a property
+// of the filesystem the path is mounted on, not of the operating system: a
+// case-insensitive APFS, NTFS or FAT volume folds them even on a Unix kernel,
+// while a case-sensitive volume keeps distinct names. Rather than assume a
+// rule per GOOS, each component is probed against the live directory: if the
+// component has no exact on-disk spelling but stat-ing that spelling resolves
+// to another entry that differs only in case, the volume folds case and the
+// on-disk spelling is used. On a case-sensitive volume the stat fails (or
+// names a different file), so the lexical spelling is left untouched. As soon
+// as a component cannot be inspected, the remaining components keep their
+// lexical spelling; such paths then fail through the usual import error
+// paths.
+func (p *parser) canonicalCasePath(resolved string) string {
+	sep := string(filepath.Separator)
+	vol := filepath.VolumeName(resolved)
+	rest := strings.TrimPrefix(resolved[len(vol):], sep)
+	components := strings.Split(rest, sep)
+
+	current := vol
+	if current == "" {
+		current = sep
+	} else {
+		current += sep
+	}
+
+	for i, comp := range components {
+		if comp == "" || comp == "." || comp == ".." {
+			current = filepath.Join(current, comp)
+			continue
+		}
+
+		entries, err := p.readDirNames(current)
+		if err != nil {
+			// Cannot canonicalize from here on; keep the rest lexical.
+			return filepath.Join(append([]string{current}, components[i:]...)...)
+		}
+
+		actual := comp
+		if !slices.Contains(entries, comp) {
+			// No entry with the exact spelling. Only fold when the live
+			// filesystem actually resolves this spelling to a sibling
+			// entry that differs in case alone.
+			if lexicalInfo, err := os.Stat(filepath.Join(current, comp)); err == nil {
+				for _, name := range entries {
+					if !strings.EqualFold(name, comp) {
+						continue
+					}
+					realInfo, err := os.Stat(filepath.Join(current, name))
+					if err == nil && os.SameFile(lexicalInfo, realInfo) {
+						actual = name
+					}
+					break
+				}
+			}
+		}
+		current = filepath.Join(current, actual)
+	}
+
+	return current
+}
+
+// readDirNames returns the entry names of dir, memoized for the duration of
+// the parse so canonicalizing many paths in the same tree does not re-read
+// directories.
+func (p *parser) readDirNames(dir string) ([]string, error) {
+	if p.dirEntriesCache != nil {
+		if names, ok := p.dirEntriesCache[dir]; ok {
+			return names, nil
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	if p.dirEntriesCache == nil {
+		p.dirEntriesCache = make(map[string][]string)
+	}
+	p.dirEntriesCache[dir] = names
+	return names, nil
+}
+
 // doSingleImport lexes the individual file at importFile and returns
 // its tokens or an error, if any.
 func (p *parser) doSingleImport(importFile string) ([]Token, error) {
+	// Stat before opening: on some platforms opening certain non-regular
+	// files (a FIFO, for example) blocks until another end shows up, so
+	// opening first could hang the adaptation. os.Stat follows symlinks,
+	// matching the previous open-then-fstat behavior for aliases.
+	info, err := os.Stat(importFile)
+	if err != nil {
+		return nil, p.Errf("Could not import %s: %v", importFile, err)
+	}
+	if info.IsDir() {
+		return nil, p.Errf("Could not import %s: is a directory", importFile)
+	}
+	if info.Mode()&os.ModeType != 0 {
+		// a non-regular file (FIFO, socket, device, ...) is not a
+		// readable Caddyfile; reject it with the directory case's
+		// error wrapping and category
+		return nil, p.Errf("Could not import %s: not a regular file", importFile)
+	}
+
 	file, err := os.Open(importFile)
 	if err != nil {
 		return nil, p.Errf("Could not import %s: %v", importFile, err)
 	}
 	defer file.Close()
-
-	if info, err := file.Stat(); err != nil {
-		return nil, p.Errf("Could not import %s: %v", importFile, err)
-	} else if info.IsDir() {
-		return nil, p.Errf("Could not import %s: is a directory", importFile)
-	}
 
 	input, err := io.ReadAll(file)
 	if err != nil {
