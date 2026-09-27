@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"go.uber.org/zap"
@@ -117,6 +118,9 @@ type parser struct {
 	definedSnippets map[string][]Token
 	nesting         int
 	importGraph     importGraph
+	// realPathCache memoizes canonical (symlink-resolved) paths of
+	// lexical file paths; see parser.realPath.
+	realPathCache map[string]string
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -412,75 +416,29 @@ func (p *parser) doImport(nesting int) error {
 		importedTokens = p.definedSnippets[importPattern]
 		if len(importedTokens) > 0 {
 			// just grab the first one
-			nodes = append(nodes, fmt.Sprintf("%s:%s", importedTokens[0].File, importedTokens[0].snippetName))
+			nodes = append(nodes, p.fileNodeName(importedTokens[0].File, importedTokens[0].snippetName))
 		}
 	} else {
-		// make path relative to the file of the _token_ being processed rather
-		// than current working directory (issue #867) and then use glob to get
-		// list of matching filenames
-		absFile, err := caddy.FastAbs(p.Dispenser.File())
+		// expand file imports (and globs) into tokens; nodes are the
+		// canonical file identities so the import graph tracks the same
+		// real file regardless of how it was addressed
+		fileTokens, fileNodes, err := p.resolveFileImports(importPattern)
 		if err != nil {
-			return p.Errf("Failed to get absolute path of file: %s: %v", p.Dispenser.File(), err)
+			return err
 		}
-
-		var matches []string
-		var globPattern string
-		if !filepath.IsAbs(importPattern) {
-			globPattern = filepath.Join(filepath.Dir(absFile), importPattern)
-		} else {
-			globPattern = importPattern
-		}
-		if strings.Count(globPattern, "*") > 1 || strings.Count(globPattern, "?") > 1 ||
-			(strings.Contains(globPattern, "[") && strings.Contains(globPattern, "]")) {
-			// See issue #2096 - a pattern with many glob expansions can hang for too long
-			return p.Errf("Glob pattern may only contain one wildcard (*), but has others: %s", globPattern)
-		}
-		matches, err = filepath.Glob(globPattern)
-		if err != nil {
-			return p.Errf("Failed to use import pattern %s: %v", importPattern, err)
-		}
-		if len(matches) == 0 {
-			if strings.ContainsAny(globPattern, "*?[]") {
-				caddy.Log().Warn("No files matching import glob pattern", zap.String("pattern", importPattern))
-			} else {
-				return p.Errf("File to import not found: %s", importPattern)
-			}
-		} else {
-			// See issue #5295 - should skip any files that start with a . when iterating over them.
-			sep := string(filepath.Separator)
-			segGlobPattern := strings.Split(globPattern, sep)
-			if strings.HasPrefix(segGlobPattern[len(segGlobPattern)-1], "*") {
-				var tmpMatches []string
-				for _, m := range matches {
-					seg := strings.Split(m, sep)
-					if !strings.HasPrefix(seg[len(seg)-1], ".") {
-						tmpMatches = append(tmpMatches, m)
-					}
-				}
-				matches = tmpMatches
-			}
-		}
-
-		// collect all the imported tokens
-		for _, importFile := range matches {
-			newTokens, err := p.doSingleImport(importFile)
-			if err != nil {
-				return err
-			}
-			importedTokens = append(importedTokens, newTokens...)
-		}
-		nodes = matches
+		importedTokens = fileTokens
+		nodes = fileNodes
 	}
 
-	nodeName := p.File()
-	if p.Token().snippetName != "" {
-		nodeName += fmt.Sprintf(":%s", p.Token().snippetName)
-	}
+	nodeName := p.graphNodeName()
 	p.importGraph.addNode(nodeName)
 	p.importGraph.addNodes(nodes)
 	if err := p.importGraph.addEdges(nodeName, nodes); err != nil {
 		p.importGraph.removeNodes(nodes)
-		return err
+		// surface the offending import site along with the cycle chain so
+		// the error is diagnosable even when the loop closes through an
+		// alias that resolves to the current file
+		return p.Errf("%v (while importing %s)", err, importPattern)
 	}
 
 	// copy the tokens so we don't overwrite p.definedSnippets
@@ -583,6 +541,172 @@ func (p *parser) doImport(nesting int) error {
 	return nil
 }
 
+// graphNodeName returns the import-graph node for the file currently
+// being processed. The file part is its canonical identity (see
+// realPath) so cycles are tracked by real file, and snippet tokens are
+// namespaced by snippet name so importing a snippet remains distinct
+// from importing its file.
+func (p *parser) graphNodeName() string {
+	return p.fileNodeName(p.File(), p.Token().snippetName)
+}
+
+// fileNodeName builds the canonical graph node for a file, optionally
+// namespaced by snippet name.
+func (p *parser) fileNodeName(file, snippet string) string {
+	name := file
+	if real, err := p.realPath(file); err == nil {
+		name = real
+	}
+	if snippet != "" {
+		name += fmt.Sprintf(":%s", snippet)
+	}
+	return name
+}
+
+// resolveFileImports expands an import pattern (a concrete path or a
+// glob) into the imported tokens. It also returns the canonical
+// identities of the imported files, for import-cycle tracking.
+//
+// Canonical identities are symlink-resolved, absolute, cleaned paths, so
+// the same physical file reached by different spellings (symlink
+// aliases, ".." segments, or a mix of absolute and relative paths) is
+// treated as one file. The lexical path is still used to open the file;
+// once read, its tokens are anchored to the canonical path, so a file
+// reached through a symlink resolves its own relative imports against
+// the file that declares them.
+//
+// Within a single glob, a file matched more than once (for example both
+// a real file and a symlink to it) expands only once, in a deterministic
+// order based on the canonical path. Explicitly repeated imports are
+// different statements and keep their own semantics.
+func (p *parser) resolveFileImports(importPattern string) ([]Token, []string, error) {
+	// make path relative to the file of the _token_ being processed rather
+	// than current working directory (issue #867) and then use glob to get
+	// list of matching filenames
+	absFile, err := caddy.FastAbs(p.Dispenser.File())
+	if err != nil {
+		return nil, nil, p.Errf("Failed to get absolute path of file: %s: %v", p.Dispenser.File(), err)
+	}
+
+	var globPattern string
+	if !filepath.IsAbs(importPattern) {
+		globPattern = filepath.Join(filepath.Dir(absFile), importPattern)
+	} else {
+		globPattern = importPattern
+	}
+	if strings.Count(globPattern, "*") > 1 || strings.Count(globPattern, "?") > 1 ||
+		(strings.Contains(globPattern, "[") && strings.Contains(globPattern, "]")) {
+		// See issue #2096 - a pattern with many glob expansions can hang for too long
+		return nil, nil, p.Errf("Glob pattern may only contain one wildcard (*), but has others: %s", globPattern)
+	}
+	matches, err := filepath.Glob(globPattern)
+	if err != nil {
+		return nil, nil, p.Errf("Failed to use import pattern %s: %v", importPattern, err)
+	}
+	if len(matches) == 0 {
+		if strings.ContainsAny(globPattern, "*?[]") {
+			caddy.Log().Warn("No files matching import glob pattern", zap.String("pattern", importPattern))
+			return nil, nil, nil
+		}
+		return nil, nil, p.Errf("File to import not found: %s", importPattern)
+	}
+
+	// See issue #5295 - should skip any files that start with a . when iterating over them.
+	sep := string(filepath.Separator)
+	segGlobPattern := strings.Split(globPattern, sep)
+	if strings.HasPrefix(segGlobPattern[len(segGlobPattern)-1], "*") {
+		var tmpMatches []string
+		for _, m := range matches {
+			seg := strings.Split(m, sep)
+			if !strings.HasPrefix(seg[len(seg)-1], ".") {
+				tmpMatches = append(tmpMatches, m)
+			}
+		}
+		matches = tmpMatches
+	}
+
+	// A single glob statement may address the same real file more than
+	// once (a file and a symlink alias, two aliases, or equivalent
+	// spellings). Resolve each lexical match to its canonical identity,
+	// drop duplicates, and sort by canonical path so the expansion order
+	// is stable and independent of how the pattern was written or the
+	// order the filesystem returned entries in.
+	type resolvedImport struct {
+		lexical string // path used to read the file and anchor its relative imports
+		real    string // canonical identity used for dedup and cycle tracking
+	}
+	resolved := make([]resolvedImport, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		realPath, err := p.realPath(match)
+		if err != nil {
+			return nil, nil, p.Errf("Could not resolve import %s: %v", match, err)
+		}
+		if _, dup := seen[realPath]; dup {
+			continue
+		}
+		seen[realPath] = struct{}{}
+		resolved = append(resolved, resolvedImport{lexical: match, real: realPath})
+	}
+	slices.SortFunc(resolved, func(a, b resolvedImport) int {
+		return strings.Compare(a.real, b.real)
+	})
+
+	var importedTokens []Token
+	nodes := make([]string, 0, len(resolved))
+	for _, imp := range resolved {
+		newTokens, err := p.doSingleImport(imp.lexical)
+		if err != nil {
+			return nil, nil, err
+		}
+		importedTokens = append(importedTokens, newTokens...)
+		nodes = append(nodes, imp.real)
+	}
+
+	return importedTokens, nodes, nil
+}
+
+// realPath returns the canonical identity of a file path: absolute,
+// cleaned, and with symlinks resolved. It is used to recognize the same
+// physical file across different spellings. Results are memoized for the
+// duration of a parse so repeated adaptation over the same file tree is
+// consistent and avoids redundant filesystem work.
+//
+// If a path cannot be fully evaluated (for example a dangling symlink),
+// it falls back to the cleaned absolute path; the subsequent open in
+// doSingleImport then reports the underlying I/O error using the
+// existing error paths.
+func (p *parser) realPath(path string) (string, error) {
+	if p.realPathCache == nil {
+		p.realPathCache = make(map[string]string)
+	}
+	if cached, ok := p.realPathCache[path]; ok {
+		return cached, nil
+	}
+
+	abs, err := caddy.FastAbs(path)
+	if err != nil {
+		return "", err
+	}
+
+	// Resolve symlinks to obtain the real file identity. If the path
+	// cannot be fully evaluated (a dangling symlink, a permission error,
+	// ...), fall back to the cleaned absolute path: the subsequent open
+	// in doSingleImport then reports the underlying I/O error using the
+	// existing error paths, so unreadable imports keep their established
+	// error categories.
+	real := abs
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		real = filepath.Clean(resolved)
+	}
+	if osPathCaseInsensitive {
+		real = strings.ToLower(real)
+	}
+
+	p.realPathCache[path] = real
+	return real, nil
+}
+
 // doSingleImport lexes the individual file at importFile and returns
 // its tokens or an error, if any.
 func (p *parser) doSingleImport(importFile string) ([]Token, error) {
@@ -615,8 +739,11 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 	}
 
 	// Tack the file path onto these tokens so errors show the imported file's name
-	// (we use full, absolute path to avoid bugs: issue #1892)
-	filename, err := caddy.FastAbs(importFile)
+	// (we use full, absolute path to avoid bugs: issue #1892). Use the canonical,
+	// symlink-resolved path: relative imports inside an imported file must resolve
+	// relative to the file that actually declares them, even when it was reached
+	// through a symlink alias or a path containing "..".
+	filename, err := p.realPath(importFile)
 	if err != nil {
 		return nil, p.Errf("Failed to get absolute path of file: %s: %v", importFile, err)
 	}

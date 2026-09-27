@@ -17,6 +17,7 @@ package caddyfile
 import (
 	"fmt"
 	"slices"
+	"strings"
 )
 
 type adjacency map[string][]string
@@ -57,8 +58,11 @@ func (i *importGraph) addEdge(from, to string) error {
 		return fmt.Errorf("one of the nodes does not exist")
 	}
 
-	if i.willCycle(to, from) {
-		return fmt.Errorf("a cycle of imports exists between %s and %s", from, to)
+	// A cycle is formed if `to` can already reach `from`; adding the edge
+	// would close the loop. Surface the full chain of files involved so the
+	// caller can diagnose the cycle rather than its depth.
+	if cycle := i.findPath(to, from); cycle != nil {
+		return fmt.Errorf("import cycle detected: %s", strings.Join(append(cycle, to), " -> "))
 	}
 
 	if i.areConnected(from, to) {
@@ -95,29 +99,41 @@ func (i *importGraph) areConnected(from, to string) bool {
 	return slices.Contains(al, to)
 }
 
-func (i *importGraph) willCycle(from, to string) bool {
-	collector := make(map[string]bool)
+// findPath searches for any path through the graph from start to target,
+// returning the chain of node names (including both ends). It returns nil
+// when the two nodes are not connected. Edge traversal order follows edge
+// insertion order so the reported chain is stable across repeated runs.
+func (i *importGraph) findPath(start, target string) []string {
+	if start == target {
+		return []string{start}
+	}
 
-	var visit func(string)
-	visit = func(start string) {
-		if !collector[start] {
-			collector[start] = true
-			for _, v := range i.edges[start] {
-				visit(v)
+	parent := map[string]string{start: ""}
+	queue := []string{start}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		for _, next := range i.edges[current] {
+			if _, visited := parent[next]; visited {
+				continue
 			}
+			parent[next] = current
+			if next == target {
+				// reconstruct the chain from target back to start
+				chain := []string{target}
+				for node := target; parent[node] != ""; node = parent[node] {
+					chain = append(chain, parent[node])
+				}
+				slices.Reverse(chain)
+				return chain
+			}
+			queue = append(queue, next)
 		}
 	}
 
-	for _, v := range i.edges[from] {
-		visit(v)
-	}
-	for k := range collector {
-		if to == k {
-			return true
-		}
-	}
-
-	return false
+	return nil
 }
 
 func (i *importGraph) exists(key string) bool {
