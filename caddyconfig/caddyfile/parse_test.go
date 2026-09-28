@@ -751,9 +751,18 @@ func TestImportReplacementInJSONWithBrace(t *testing.T) {
 			expect: `{"key":[123,123]}`,
 		},
 	} {
-		repl := makeArgsReplacer(test.args)
-		actual := repl.ReplaceKnown(test.input, "")
-		if actual != test.expect {
+		argTokens := make([]Token, len(test.args))
+		for j, arg := range test.args {
+			argTokens[j] = Token{Text: arg}
+		}
+		replaced, err := substituteImportArgs(Token{File: "test", Line: 1, Text: test.input}, argTokens)
+		if err != nil {
+			t.Fatalf("Test %d: unexpected error: %v", i, err)
+		}
+		if len(replaced) != 1 {
+			t.Fatalf("Test %d: expected a single token, got %d", i, len(replaced))
+		}
+		if actual := replaced[0].Text; actual != test.expect {
 			t.Errorf("Test %d: Expected: '%s' but got '%s'", i, test.expect, actual)
 		}
 	}
@@ -1032,5 +1041,8 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 }
 
 func testParser(input string) parser {
-	return parser{Dispenser: NewTestDispenser(input)}
+	return parser{
+		Dispenser: NewTestDispenser(input),
+		imports:   newImportSource(nil),
+	}
 }
