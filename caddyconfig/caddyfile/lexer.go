@@ -17,12 +17,18 @@ package caddyfile
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"strings"
 	"unicode"
 )
+
+// errUnclosedQuote is returned by the lexer when a quoted token runs
+// into the end of the input without a closing quote. Callers may use
+// errors.Is to detect it and attach the source location.
+var errUnclosedQuote = errors.New("unclosed quote")
 
 type (
 	// lexer is a utility which can get values, token by
@@ -32,8 +38,12 @@ type (
 	lexer struct {
 		reader       *bufio.Reader
 		token        Token
+		file         string
 		line         int
 		skippedLines int
+		// strict, when true, causes an unclosed quote to be an
+		// error instead of being tolerated up to EOF.
+		strict bool
 	}
 
 	// Token represents a single parsable unit.
@@ -43,6 +53,7 @@ type (
 		Line          int
 		Text          string
 		wasQuoted     rune // enclosing quote character, if any
+		quoteClosed   bool // whether the enclosing quote was closed
 		heredocMarker string
 		snippetName   string
 	}
@@ -54,7 +65,18 @@ type (
 // the source of the tokens, which is important to
 // determine relative paths for `import` directives.
 func Tokenize(input []byte, filename string) ([]Token, error) {
-	l := lexer{}
+	return tokenize(input, filename, false)
+}
+
+// tokenizeStrict is like Tokenize, except an unclosed
+// quote is reported as an error instead of being
+// tolerated up to EOF.
+func tokenizeStrict(input []byte, filename string) ([]Token, error) {
+	return tokenize(input, filename, true)
+}
+
+func tokenize(input []byte, filename string, strict bool) ([]Token, error) {
+	l := lexer{file: filename, strict: strict}
 	if err := l.load(bytes.NewReader(input)); err != nil {
 		return nil, err
 	}
@@ -109,9 +131,10 @@ func (l *lexer) next() (bool, error) {
 	var comment, quoted, btQuoted, inHeredoc, heredocEscaped, escaped bool
 	var heredocMarker string
 
-	makeToken := func(quoted rune) bool {
+	makeToken := func(quoted rune, closed bool) bool {
 		l.token.Text = string(val)
 		l.token.wasQuoted = quoted
+		l.token.quoteClosed = closed
 		l.token.heredocMarker = heredocMarker
 		return true
 	}
@@ -123,25 +146,32 @@ func (l *lexer) next() (bool, error) {
 		// If no EOF, then we had a problem.
 		ch, _, err := l.reader.ReadRune()
 		if err != nil {
-			if len(val) > 0 {
-				if inHeredoc {
-					return false, fmt.Errorf("incomplete heredoc <<%s on line #%d, expected ending marker %s", heredocMarker, l.line+l.skippedLines, heredocMarker)
-				}
+			if inHeredoc && len(val) > 0 {
+				return false, fmt.Errorf("incomplete heredoc <<%s on line #%d, expected ending marker %s", heredocMarker, l.line+l.skippedLines, heredocMarker)
+			}
 
-				return makeToken(0), nil
+			if (quoted || btQuoted) && l.strict {
+				quoteCh := byte('"')
+				if btQuoted {
+					quoteCh = '`'
+				}
+				return false, fmt.Errorf("%w %c opened on line #%d, at %s:%d",
+					errUnclosedQuote, quoteCh, l.token.Line, l.file, l.line+l.skippedLines)
+			}
+
+			if len(val) > 0 {
+				return makeToken(0, false), nil
 			}
 			if err == io.EOF {
 				return false, nil
 			}
 			return false, err
-		}
-
-		// detect whether we have the start of a heredoc
+		} // detect whether we have the start of a heredoc
 		if (!quoted && !btQuoted) && (!inHeredoc && !heredocEscaped) &&
 			len(val) > 1 && string(val[:2]) == "<<" {
 			// a space means it's just a regular token and not a heredoc
 			if ch == ' ' {
-				return makeToken(0), nil
+				return makeToken(0, false), nil
 			}
 
 			// skip CR, we only care about LF
@@ -196,7 +226,7 @@ func (l *lexer) next() (bool, error) {
 				// set the line counter, and make the token
 				l.line += l.skippedLines
 				l.skippedLines = 0
-				return makeToken('<'), nil
+				return makeToken('<', true), nil
 			}
 
 			// stay in the heredoc until we find the ending marker
@@ -220,7 +250,7 @@ func (l *lexer) next() (bool, error) {
 				escaped = false
 			} else {
 				if (quoted && ch == '"') || (btQuoted && ch == '`') {
-					return makeToken(ch), nil
+					return makeToken(ch, true), nil
 				}
 			}
 			// allow quoted text to wrap continue on multiple lines
@@ -254,7 +284,7 @@ func (l *lexer) next() (bool, error) {
 			}
 			// any kind of space means we're at the end of this token
 			if len(val) > 0 {
-				return makeToken(0), nil
+				return makeToken(0, false), nil
 			}
 			continue
 		}
@@ -367,6 +397,7 @@ func (t Token) Clone() Token {
 		Line:          t.Line,
 		Text:          t.Text,
 		wasQuoted:     t.wasQuoted,
+		quoteClosed:   t.quoteClosed,
 		heredocMarker: t.heredocMarker,
 		snippetName:   t.snippetName,
 	}
