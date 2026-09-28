@@ -454,6 +454,52 @@ func TestAdapterDanglingSymlinkCategory(t *testing.T) {
 	}
 }
 
+// A relative import in the entry file itself must resolve against the
+// entry's real directory when the entry is named through a symlink; it
+// must not drift to the directory the alias lives in.
+func TestImportEntryRelativeThroughSymlink(t *testing.T) {
+	dir := t.TempDir()
+	writeImportFile(t, filepath.Join(dir, "real", "Caddyfile"), "import sub/b.conf\n"+site("host-a"))
+	writeImportFile(t, filepath.Join(dir, "real", "sub", "b.conf"), site("host-b"))
+	entry := filepath.Join(dir, "alias", "Caddyfile")
+	symlinkOrSkip(t, filepath.Join(dir, "real", "Caddyfile"), entry)
+
+	body, err := os.ReadFile(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks, err := Parse(entry, body)
+	if err != nil {
+		t.Fatalf("expected relative import to resolve against the real entry, got: %v", err)
+	}
+
+	got := blockKeys(blocks)
+	want := []string{"host-b", "host-a"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("expected %v, got %v", want, got)
+	}
+}
+
+// An entry reached through a symlink that imports itself via an alias in
+// its own directory is a genuine cycle and must fail.
+func TestImportEntryCycleThroughAlias(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "real", "a.conf")
+	writeImportFile(t, a, "import link.conf\n"+site("host-a"))
+	symlinkOrSkip(t, a, filepath.Join(dir, "real", "link.conf"))
+	entry := filepath.Join(dir, "alias", "Caddyfile")
+	symlinkOrSkip(t, a, entry)
+
+	_, err := Parse(entry, []byte("import link.conf\n"+site("host-root")))
+	if err == nil {
+		t.Fatal("expected a cycle error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "cycle") || !strings.Contains(msg, "a.conf") || !strings.Contains(msg, "link.conf") {
+		t.Errorf("expected a cycle chain naming the files, got: %v", err)
+	}
+}
+
 // fsCaseInsensitive reports whether dir folds file-name case, observed from
 // the live filesystem rather than from the target operating system. A
 // default APFS or NTFS/FAT volume folds case even when the kernel is Unix-like.

@@ -419,7 +419,7 @@ func (p *parser) doImport(nesting int) error {
 		importedTokens = p.definedSnippets[importPattern]
 		if len(importedTokens) > 0 {
 			// just grab the first one
-			nodes = append(nodes, p.fileNodeName(importedTokens[0].File, importedTokens[0].snippetName))
+			nodes = append(nodes, p.canonicalFileNodeName(importedTokens[0].File, importedTokens[0].snippetName))
 		}
 	} else {
 		// expand file imports (and globs) into tokens; nodes are the
@@ -547,12 +547,14 @@ func (p *parser) doImport(nesting int) error {
 // graphNodeName returns the import-graph node for the file currently
 // being processed. Tokens belonging to a file read from disk carry its
 // canonical identity in File (set in doSingleImport), so the same real
-// file reached through an alias or ".." maps to one node. The virtual
+// file reached through an alias or ".." maps to one node. The entry
+// file's own tokens keep their lexical File (so its diagnostics stay
+// stable), hence the current file is canonicalized here. The virtual
 // root of an inline adaptation ("Caddyfile") keeps its lexical name.
 // Snippet tokens are namespaced by snippet name so importing a snippet
 // remains distinct from importing its file.
 func (p *parser) graphNodeName() string {
-	return p.fileNodeName(p.File(), p.Token().snippetName)
+	return p.canonicalFileNodeName(p.File(), p.Token().snippetName)
 }
 
 // fileNodeName builds the graph node for a file, optionally namespaced
@@ -564,6 +566,21 @@ func (p *parser) fileNodeName(file, snippet string) string {
 		name += fmt.Sprintf(":%s", snippet)
 	}
 	return name
+}
+
+// canonicalFileNodeName is fileNodeName for a lexical file name that may
+// be an alias: it resolves the file to its canonical identity first. A
+// name that does not denote a file on disk (the virtual inline root
+// "Caddyfile", a test-only filename) is used verbatim so those nodes are
+// not accidentally renamed.
+func (p *parser) canonicalFileNodeName(file, snippet string) string {
+	name := file
+	if info, err := os.Stat(name); err == nil && info.Mode().IsRegular() {
+		if real, err := p.realPath(name); err == nil {
+			name = real
+		}
+	}
+	return p.fileNodeName(name, snippet)
 }
 
 // resolveFileImports expands an import pattern (a concrete path or a
@@ -585,15 +602,18 @@ func (p *parser) fileNodeName(file, snippet string) string {
 func (p *parser) resolveFileImports(importPattern string) ([]Token, []string, error) {
 	// make path relative to the file of the _token_ being processed rather
 	// than current working directory (issue #867) and then use glob to get
-	// list of matching filenames
-	absFile, err := caddy.FastAbs(p.Dispenser.File())
+	// list of matching filenames. Resolve through symlinks and ".." first:
+	// a relative import declared in a file reached through an alias must
+	// resolve against the directory that actually holds the declaring file,
+	// not the directory the alias lives in.
+	anchorFile, err := p.realPath(p.Dispenser.File())
 	if err != nil {
 		return nil, nil, p.Errf("Failed to get absolute path of file: %s: %v", p.Dispenser.File(), err)
 	}
 
 	var globPattern string
 	if !filepath.IsAbs(importPattern) {
-		globPattern = filepath.Join(filepath.Dir(absFile), importPattern)
+		globPattern = filepath.Join(filepath.Dir(anchorFile), importPattern)
 	} else {
 		globPattern = importPattern
 	}
