@@ -45,9 +45,10 @@ func NewDispenser(tokens []Token) *Dispenser {
 }
 
 // NewTestDispenser parses input into tokens and creates a new
-// Dispenser for test purposes only; any errors are fatal.
+// Dispenser for test purposes only; any errors are fatal. It expands
+// environment variables against the environment at call time.
 func NewTestDispenser(input string) *Dispenser {
-	tokens, err := allTokens("Testfile", []byte(input))
+	tokens, err := allTokens("Testfile", []byte(input), newEnvSnapshot())
 	if err != nil && err != io.EOF {
 		log.Fatalf("getting all tokens from input: %v", err)
 	}

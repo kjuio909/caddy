@@ -15,7 +15,6 @@
 package caddyfile
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -35,20 +34,26 @@ import (
 // pass in nil instead.
 //
 // Environment variables in {$ENVIRONMENT_VARIABLE} notation
-// will be replaced before parsing begins.
+// are expanded after lexing, against a snapshot of the process
+// environment taken when Parse begins; the same snapshot applies
+// to every imported file.
 func Parse(filename string, input []byte) ([]ServerBlock, error) {
 	// unfortunately, we must copy the input because parsing must
-	// remain a read-only operation, but we have to expand environment
-	// variables before we parse, which changes the underlying array (#4422)
+	// remain a read-only operation on the caller's buffer (#4422)
 	inputCopy := make([]byte, len(input))
 	copy(inputCopy, input)
 
-	tokens, err := allTokens(filename, inputCopy)
+	// capture the environment once so the top-level file and all of
+	// its imports resolve variables against the same snapshot
+	env := newEnvSnapshot()
+
+	tokens, err := allTokens(filename, inputCopy, env)
 	if err != nil {
 		return nil, err
 	}
 	p := parser{
 		Dispenser: NewDispenser(tokens),
+		env:       env,
 		importGraph: importGraph{
 			nodes: make(map[string]struct{}),
 			edges: make(adjacency),
@@ -59,55 +64,13 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 
 // allTokens lexes the entire input, but does not parse it.
 // It returns all the tokens from the input, unstructured
-// and in order. It may mutate input as it expands env vars.
-func allTokens(filename string, input []byte) ([]Token, error) {
-	return Tokenize(replaceEnvVars(input), filename)
-}
-
-// replaceEnvVars replaces all occurrences of environment variables.
-// It mutates the underlying array and returns the updated slice.
-func replaceEnvVars(input []byte) []byte {
-	var offset int
-	for {
-		begin := bytes.Index(input[offset:], spanOpen)
-		if begin < 0 {
-			break
-		}
-		begin += offset // make beginning relative to input, not offset
-		end := bytes.Index(input[begin+len(spanOpen):], spanClose)
-		if end < 0 {
-			break
-		}
-		end += begin + len(spanOpen) // make end relative to input, not begin
-
-		// get the name; if there is no name, skip it
-		envString := input[begin+len(spanOpen) : end]
-		if len(envString) == 0 {
-			offset = end + len(spanClose)
-			continue
-		}
-
-		// split the string into a key and an optional default
-		envParts := strings.SplitN(string(envString), envVarDefaultDelimiter, 2)
-
-		// do a lookup for the env var, replace with the default if not found
-		envVarValue, found := os.LookupEnv(envParts[0])
-		if !found && len(envParts) == 2 {
-			envVarValue = envParts[1]
-		}
-
-		// get the value of the environment variable
-		// note that this causes one-level deep chaining
-		envVarBytes := []byte(envVarValue)
-
-		// splice in the value
-		input = append(input[:begin],
-			append(envVarBytes, input[end+len(spanClose):]...)...)
-
-		// continue at the end of the replacement
-		offset = begin + len(envVarBytes)
+// and in order, with environment variables expanded against env.
+func allTokens(filename string, input []byte, env envSnapshot) ([]Token, error) {
+	tokens, err := Tokenize(input, filename)
+	if err != nil {
+		return nil, err
 	}
-	return input
+	return expandEnvTokens(tokens, env)
 }
 
 type parser struct {
@@ -117,6 +80,7 @@ type parser struct {
 	definedSnippets map[string][]Token
 	nesting         int
 	importGraph     importGraph
+	env             envSnapshot // environment shared by the top-level file and all imports
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -609,7 +573,7 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 		return []Token{}, nil
 	}
 
-	importedTokens, err := allTokens(importFile, input)
+	importedTokens, err := allTokens(importFile, input, p.env)
 	if err != nil {
 		return nil, p.Errf("Could not read tokens while importing %s: %v", importFile, err)
 	}
@@ -814,10 +778,3 @@ func (s Segment) Directive() string {
 	}
 	return ""
 }
-
-// spanOpen and spanClose are used to bound spans that
-// contain the name of an environment variable.
-var (
-	spanOpen, spanClose    = []byte{'{', '$'}, []byte{'}'}
-	envVarDefaultDelimiter = ":"
-)

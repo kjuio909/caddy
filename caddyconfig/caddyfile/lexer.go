@@ -34,6 +34,16 @@ type (
 		token        Token
 		line         int
 		skippedLines int
+
+		// inEnvNotation is true while scanning an open environment
+		// variable notation ({$...}); envEscaped does the same for an
+		// escaped notation (\{$...\}). While either is true, every
+		// byte—including whitespace, quotes and newlines—is collected
+		// into the current token, so the notation is kept intact as a
+		// single lexical unit and can be expanded, after lexing,
+		// without its value ever being re-tokenized.
+		inEnvNotation bool
+		envEscaped    bool
 	}
 
 	// Token represents a single parsable unit.
@@ -45,6 +55,12 @@ type (
 		wasQuoted     rune // enclosing quote character, if any
 		heredocMarker string
 		snippetName   string
+
+		// lineBreaks is the number of line breaks the token spans in
+		// the lexed source. It is captured before environment variables
+		// are expanded, so newlines introduced by a substituted value
+		// do not alter token line boundaries.
+		lineBreaks int
 	}
 )
 
@@ -113,6 +129,15 @@ func (l *lexer) next() (bool, error) {
 		l.token.Text = string(val)
 		l.token.wasQuoted = quoted
 		l.token.heredocMarker = heredocMarker
+		// freeze the token's line span as lexed, before any
+		// environment variable value is spliced into the text
+		l.token.lineBreaks = strings.Count(l.token.Text, "\n")
+		if quoted == '<' {
+			// heredocs have an extra linebreak because the opening
+			// delimiter is on its own line and is not included in the
+			// token Text itself, and the trailing newline is removed.
+			l.token.lineBreaks += 2
+		}
 		return true
 	}
 
@@ -200,6 +225,45 @@ func (l *lexer) next() (bool, error) {
 			}
 
 			// stay in the heredoc until we find the ending marker
+			continue
+		}
+
+		// if we're inside an open environment variable notation,
+		// collect every byte verbatim until the notation closes; this
+		// keeps the whole notation (and the value or default it expands
+		// to) within a single token, so whitespace, quotes, newlines and
+		// braces inside it can never be lexed into additional tokens
+		if l.inEnvNotation {
+			if l.envEscaped && ch == '\\' {
+				// an escaped notation is closed by \}; a backslash
+				// followed by anything else is literal content
+				if p, perr := l.reader.Peek(1); perr == nil && len(p) > 0 && p[0] == '}' {
+					if _, _, rerr := l.reader.ReadRune(); rerr == nil {
+						val = append(val, '\\', '}')
+						l.inEnvNotation = false
+						l.envEscaped = false
+						continue
+					}
+				}
+			}
+			// a notation never legitimately spans a line; a newline
+			// therefore ends the token, leaving an unclosed notation
+			// that post-lexing expansion reports as an error
+			if ch == '\n' {
+				l.line += 1 + l.skippedLines
+				l.skippedLines = 0
+				l.inEnvNotation = false
+				l.envEscaped = false
+				return makeToken(0), nil
+			}
+			val = append(val, ch)
+			// a closing brace ends the protected scan; for an escaped
+			// notation, an unescaped '}' still ends it, and post-lexing
+			// expansion decides how to interpret the pair
+			if ch == '}' {
+				l.inEnvNotation = false
+				l.envEscaped = false
+			}
 			continue
 		}
 
@@ -291,6 +355,16 @@ func (l *lexer) next() (bool, error) {
 		}
 
 		val = append(val, ch)
+
+		// detect the start of an environment variable notation so the
+		// whole notation is collected into one token; "\{$" (a single
+		// backslash immediately before "{$") opens an escaped notation,
+		// which is preserved literally and never resolved
+		if ch == '$' && len(val) >= 2 && val[len(val)-2] == '{' {
+			l.inEnvNotation = true
+			l.envEscaped = len(val) >= 3 && val[len(val)-3] == '\\' &&
+				(len(val) < 4 || val[len(val)-4] != '\\')
+		}
 	}
 }
 
@@ -349,14 +423,7 @@ func (t Token) Quoted() bool {
 
 // NumLineBreaks counts how many line breaks are in the token text.
 func (t Token) NumLineBreaks() int {
-	lineBreaks := strings.Count(t.Text, "\n")
-	if t.wasQuoted == '<' {
-		// heredocs have an extra linebreak because the opening
-		// delimiter is on its own line and is not included in the
-		// token Text itself, and the trailing newline is removed.
-		lineBreaks += 2
-	}
-	return lineBreaks
+	return t.lineBreaks
 }
 
 // Clone returns a deep copy of the token.
@@ -369,6 +436,7 @@ func (t Token) Clone() Token {
 		wasQuoted:     t.wasQuoted,
 		heredocMarker: t.heredocMarker,
 		snippetName:   t.snippetName,
+		lineBreaks:    t.lineBreaks,
 	}
 }
 

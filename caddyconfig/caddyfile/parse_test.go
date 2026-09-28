@@ -15,7 +15,8 @@
 package caddyfile
 
 import (
-	"bytes"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,7 +112,7 @@ func TestParseVariadic(t *testing.T) {
 func TestAllTokens(t *testing.T) {
 	input := []byte("a b c\nd e")
 	expected := []string{"a", "b", "c", "d", "e"}
-	tokens, err := allTokens("TestAllTokens", input)
+	tokens, err := allTokens("TestAllTokens", input, newEnvSnapshot())
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
 	}
@@ -634,8 +635,14 @@ func TestParseAll(t *testing.T) {
 }
 
 func TestEnvironmentReplacement(t *testing.T) {
-	os.Setenv("FOOBAR", "foobar")
-	os.Setenv("CHAINED", "$FOOBAR")
+	env := envSnapshot{
+		"FOOBAR":  "foobar",
+		"CHAINED": "$FOOBAR",
+		"EMPTY":   "",
+		"SPACES":  `a b "c d"`,
+		"BRACES":  "{$OTHER} {x} }",
+		"NEWLINE": "line1\nline2",
+	}
 
 	for i, test := range []struct {
 		input  string
@@ -648,14 +655,6 @@ func TestEnvironmentReplacement(t *testing.T) {
 		{
 			input:  "foo",
 			expect: "foo",
-		},
-		{
-			input:  "{$NOT_SET}",
-			expect: "",
-		},
-		{
-			input:  "foo{$NOT_SET}bar",
-			expect: "foobar",
 		},
 		{
 			input:  "{$FOOBAR}",
@@ -683,7 +682,7 @@ func TestEnvironmentReplacement(t *testing.T) {
 		},
 		{
 			input:  "{$CHAINED}",
-			expect: "$FOOBAR", // should not chain env expands
+			expect: "$FOOBAR", // values are never re-expanded
 		},
 		{
 			input:  "{$FOO:default}",
@@ -695,37 +694,133 @@ func TestEnvironmentReplacement(t *testing.T) {
 		},
 		{
 			input:  "foo{$BAR:$FOOBAR}baz",
-			expect: "foo$FOOBARbaz", // should not chain env expands
+			expect: "foo$FOOBARbaz", // defaults are never re-expanded
 		},
 		{
-			input:  "{$FOOBAR",
-			expect: "{$FOOBAR",
+			input:  "{$EMPTY:default}",
+			expect: "", // an explicitly set empty value is not "unset"
 		},
 		{
-			input:  "{$LONGER_NAME $FOOBAR}",
-			expect: "",
+			input:  `foo{$SPACES}bar`,
+			expect: `fooa b "c d"bar`, // whitespace and quotes stay inside the token
 		},
 		{
-			input:  "{$}",
-			expect: "{$}",
+			input:  "{$BRACES}",
+			expect: "{$OTHER} {x} }", // braces in a value are inert
 		},
 		{
-			input:  "{$$}",
-			expect: "",
+			input:  "{$NEWLINE}",
+			expect: "line1\nline2", // newlines stay inside the token
 		},
 		{
-			input:  "{$",
-			expect: "{$",
+			input:  `\{$FOOBAR\}`,
+			expect: "{$FOOBAR}", // escaped notation stays literal and is not looked up
 		},
 		{
-			input:  "}{$",
-			expect: "}{$",
+			input:  `before \{$FOOBAR\} after`,
+			expect: "before {$FOOBAR} after",
+		},
+		{
+			input:  `\{$NOT_SET\}`,
+			expect: "{$NOT_SET}", // escaping an unset variable still yields literal text
+		},
+		{
+			input:  "{x} {y} plain",
+			expect: "{x} {y} plain", // ordinary braces are untouched
 		},
 	} {
-		actual := replaceEnvVars([]byte(test.input))
-		if !bytes.Equal(actual, []byte(test.expect)) {
-			t.Errorf("Test %d: Expected: '%s' but got '%s'", i, test.expect, actual)
+		tok := Token{File: "Caddyfile", Line: 1}
+		actual, err := expandTokenText(test.input, env, &tok)
+		if err != nil {
+			t.Errorf("Test %d (%q): unexpected error: %v", i, test.input, err)
+			continue
 		}
+		if actual != test.expect {
+			t.Errorf("Test %d (%q): expected %q, got %q", i, test.input, test.expect, actual)
+		}
+	}
+}
+
+func TestEnvironmentReplacementErrors(t *testing.T) {
+	env := envSnapshot{"SET": "val", "EMPTY": ""}
+
+	for i, test := range []struct {
+		input       string
+		errContains string
+	}{
+		{
+			input:       "{$NOT_SET}",
+			errContains: "is not set",
+		},
+		{
+			input:       "foo{$NOT_SET}bar",
+			errContains: "is not set",
+		},
+		{
+			input:       "{$}",
+			errContains: "name must not be empty",
+		},
+		{
+			input:       "{$$}",
+			errContains: "is not set",
+		},
+		{
+			input:       "{$SET:}",
+			errContains: "no default value",
+		},
+		{
+			input:       "{$NOT_SET:}",
+			errContains: "no default value",
+		},
+		{
+			input:       "{$FOOBAR",
+			errContains: "not closed",
+		},
+		{
+			input:       "{$",
+			errContains: "not closed",
+		},
+	} {
+		tok := Token{File: "Caddyfile", Line: 7}
+		_, err := expandTokenText(test.input, env, &tok)
+		if err == nil {
+			t.Errorf("Test %d (%q): expected error containing %q, got none", i, test.input, test.errContains)
+			continue
+		}
+		if !strings.Contains(err.Error(), test.errContains) {
+			t.Errorf("Test %d (%q): expected error containing %q, got %q", i, test.input, test.errContains, err)
+		}
+		if !strings.Contains(err.Error(), "Caddyfile:7") {
+			t.Errorf("Test %d (%q): error must identify file and line, got %q", i, test.input, err)
+		}
+	}
+}
+
+func TestEnvironmentReplacementTokenBoundaries(t *testing.T) {
+	os.Setenv("CADDYFILE_TEST_INJECT", "injected }{\nrespond ")
+	defer os.Unsetenv("CADDYFILE_TEST_INJECT")
+
+	// Even though the value contains spaces, a quote, braces and a
+	// newline, it must remain a single argument of `respond`.
+	tokens, err := allTokens("Caddyfile",
+		[]byte("localhost {\n\trespond {$CADDYFILE_TEST_INJECT}\n}\n"), newEnvSnapshot())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var respondArgs []Token
+	for i, tk := range tokens {
+		if tk.Text == "respond" {
+			for j := i + 1; j < len(tokens) && tokens[j].Text != "}"; j++ {
+				respondArgs = append(respondArgs, tokens[j])
+			}
+			break
+		}
+	}
+	if len(respondArgs) != 1 {
+		t.Fatalf("expected exactly 1 respond argument, got %d: %v", len(respondArgs), respondArgs)
+	}
+	if respondArgs[0].Text != "injected }{\nrespond " {
+		t.Errorf("expected raw value in a single token, got %q", respondArgs[0].Text)
 	}
 }
 
@@ -1032,5 +1127,91 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 }
 
 func testParser(input string) parser {
-	return parser{Dispenser: NewTestDispenser(input)}
+	// tokenize without expanding environment variables; the import
+	// error-path cases feed intentionally malformed notations, and env
+	// expansion semantics are covered by dedicated tests.
+	tokens, err := Tokenize([]byte(input), "Testfile")
+	if err != nil && err != io.EOF {
+		log.Fatalf("getting tokens from input: %v", err)
+	}
+	return parser{Dispenser: NewDispenser(tokens)}
+}
+
+func TestEnvSnapshotSharedAcrossNestedImports(t *testing.T) {
+	t.Setenv("CADDY_PARSE_SITE", "nested.example")
+
+	dir := t.TempDir()
+	inner := filepath.Join(dir, "inner.caddy")
+	middle := filepath.Join(dir, "middle.caddy")
+
+	if err := os.WriteFile(inner, []byte("respond inner-{$CADDY_PARSE_SITE}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(middle, []byte("import "+inner+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	blocks, err := Parse("Caddyfile", []byte("{$CADDY_PARSE_SITE} {\n\timport "+middle+"\n}\n"))
+	if err != nil {
+		t.Fatalf("nested imports must expand against the shared snapshot: %v", err)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 server block, got %d", len(blocks))
+	}
+	if got := blocks[0].GetKeysText(); len(got) != 1 || got[0] != "nested.example" {
+		t.Errorf("top-level key must use the snapshot value, got %v", got)
+	}
+	var found string
+	for _, seg := range blocks[0].Segments {
+		if seg.Directive() == "respond" && len(seg) > 1 {
+			found = seg[1].Text
+		}
+	}
+	if found != "inner-nested.example" {
+		t.Errorf("nested imported file must use the same snapshot value, got %q", found)
+	}
+}
+
+func TestEnvSnapshotFailureStopsAdaptation(t *testing.T) {
+	dir := t.TempDir()
+	inc := filepath.Join(dir, "inc.caddy")
+	if err := os.WriteFile(inc, []byte("respond {$CADDY_PARSE_UNSET_IN_INC}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	blocks, err := Parse("Caddyfile", []byte("example.test {\n\timport "+inc+"\n}\n"))
+	if err == nil {
+		t.Fatalf("expected an error, got blocks: %v", blocks)
+	}
+	if blocks != nil {
+		t.Errorf("a failed expansion must not return partial blocks, got %v", blocks)
+	}
+	if !strings.Contains(err.Error(), "is not set") || !strings.Contains(err.Error(), inc) {
+		t.Errorf("error must name the variable and the imported file, got %v", err)
+	}
+}
+
+func TestEnvSnapshotIsPerParseCall(t *testing.T) {
+	input := []byte("{$CADDY_PARSE_VER} {\n\trespond {$CADDY_PARSE_VER}\n}\n")
+
+	t.Setenv("CADDY_PARSE_VER", "one")
+	blocks1, err := Parse("Caddyfile", input)
+	if err != nil {
+		t.Fatalf("first parse failed: %v", err)
+	}
+
+	// the second call observes a changed environment and must not reuse
+	// the first call's snapshot
+	t.Setenv("CADDY_PARSE_VER", "two")
+	blocks2, err := Parse("Caddyfile", input)
+	if err != nil {
+		t.Fatalf("second parse failed: %v", err)
+	}
+
+	if got := blocks1[0].GetKeysText()[0]; got != "one" {
+		t.Errorf("first parse expected %q, got %q", "one", got)
+	}
+	if got := blocks2[0].GetKeysText()[0]; got != "two" {
+		t.Errorf("second parse expected %q, got %q", "two", got)
+	}
 }
