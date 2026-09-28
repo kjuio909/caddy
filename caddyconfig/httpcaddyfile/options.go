@@ -101,7 +101,7 @@ func parseOptHTTPSPort(d *caddyfile.Dispenser, _ any) (any, error) {
 	return httpsPort, nil
 }
 
-func parseOptOrder(d *caddyfile.Dispenser, _ any) (any, error) {
+func parseOptOrder(d *caddyfile.Dispenser, existingVal any) (any, error) {
 	d.Next() // consume option name
 
 	// get directive name
@@ -113,6 +113,20 @@ func parseOptOrder(d *caddyfile.Dispenser, _ any) (any, error) {
 		return nil, d.Errf("%s is not a registered directive", dirName)
 	}
 
+	// Reorder for this adaptation only. A previous "order" global option in
+	// the same adaptation passes its resulting order as existingVal; the
+	// first one builds on the registered baseline. The package-level
+	// directiveOrder is never mutated, so concurrent adaptations cannot leak
+	// their ordering into each other. Copy before rearranging: slices.DeleteFunc
+	// and slices.Insert edit the backing array in place, and the baseline may
+	// be the package-level slice.
+	var baseOrder []string
+	if existing, ok := existingVal.([]string); ok {
+		baseOrder = append(baseOrder, existing...)
+	} else {
+		baseOrder = append(baseOrder, directiveOrder...)
+	}
+
 	// get positional token
 	if !d.Next() {
 		return nil, d.ArgErr()
@@ -120,7 +134,7 @@ func parseOptOrder(d *caddyfile.Dispenser, _ any) (any, error) {
 	pos := Positional(d.Val())
 
 	// if directive already had an order, drop it
-	newOrder := slices.DeleteFunc(directiveOrder, func(d string) bool {
+	newOrder := slices.DeleteFunc(baseOrder, func(d string) bool {
 		return d == dirName
 	})
 
@@ -131,7 +145,6 @@ func parseOptOrder(d *caddyfile.Dispenser, _ any) (any, error) {
 		if d.NextArg() {
 			return nil, d.ArgErr()
 		}
-		directiveOrder = newOrder
 		return newOrder, nil
 
 	case Last:
@@ -139,7 +152,6 @@ func parseOptOrder(d *caddyfile.Dispenser, _ any) (any, error) {
 		if d.NextArg() {
 			return nil, d.ArgErr()
 		}
-		directiveOrder = newOrder
 		return newOrder, nil
 
 	// if it's Before or After, continue
@@ -170,8 +182,6 @@ func parseOptOrder(d *caddyfile.Dispenser, _ any) (any, error) {
 	}
 	// insert the directive into the new order
 	newOrder = slices.Insert(newOrder, targetIndex, dirName)
-
-	directiveOrder = newOrder
 
 	return newOrder, nil
 }

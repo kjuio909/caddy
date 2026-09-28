@@ -86,11 +86,18 @@ func (st ServerType) Setup(
 		return nil, warnings, err
 	}
 
+	// Resolve the directive order for this adaptation. The "order" global
+	// option stores a per-adaptation order in options; we read it here once
+	// and thread it through every Helper and subroute build below. This keeps
+	// the ordering local to the call even when one Adapter is shared by
+	// concurrent adaptations.
+	adaptDirectiveOrder := directiveOrderForOptions(options)
+
 	// this will replace both static and user-defined placeholder shorthands
 	// with actual identifiers used by Caddy
 	replacer := NewShorthandReplacer()
 
-	originalServerBlocks, err = st.extractNamedRoutes(originalServerBlocks, options, &warnings, replacer)
+	originalServerBlocks, err = st.extractNamedRoutes(originalServerBlocks, options, &warnings, replacer, adaptDirectiveOrder)
 	if err != nil {
 		return nil, warnings, err
 	}
@@ -136,14 +143,15 @@ func (st ServerType) Setup(
 			}
 
 			h := Helper{
-				Dispenser:    caddyfile.NewDispenser(segment),
-				options:      options,
-				warnings:     &warnings,
-				matcherDefs:  matcherDefs,
-				parentBlock:  sb.block,
-				groupCounter: gc,
-				State:        state,
-				BlockState:   state,
+				Dispenser:      caddyfile.NewDispenser(segment),
+				options:        options,
+				warnings:       &warnings,
+				matcherDefs:    matcherDefs,
+				parentBlock:    sb.block,
+				groupCounter:   gc,
+				State:          state,
+				BlockState:     state,
+				directiveOrder: adaptDirectiveOrder,
 			}
 
 			results, err := dirFunc(h)
@@ -183,7 +191,7 @@ func (st ServerType) Setup(
 
 	// each pairing of listener addresses to list of server
 	// blocks is basically a server definition
-	servers, err := st.serversFromPairings(pairings, options, &warnings, gc)
+	servers, err := st.serversFromPairings(pairings, options, &warnings, gc, adaptDirectiveOrder)
 	if err != nil {
 		return nil, warnings, err
 	}
@@ -462,6 +470,7 @@ func (ServerType) extractNamedRoutes(
 	options map[string]any,
 	warnings *[]caddyconfig.Warning,
 	replacer ShorthandReplacer,
+	order []string,
 ) ([]serverBlock, error) {
 	namedRoutes := map[string]*caddyhttp.Route{}
 
@@ -498,14 +507,15 @@ func (ServerType) extractNamedRoutes(
 		}
 
 		h := Helper{
-			Dispenser:    caddyfile.NewDispenser(wholeSegment),
-			options:      options,
-			warnings:     warnings,
-			matcherDefs:  nil,
-			parentBlock:  sb.block,
-			groupCounter: gc,
-			State:        state,
-			BlockState:   state,
+			Dispenser:      caddyfile.NewDispenser(wholeSegment),
+			options:        options,
+			warnings:       warnings,
+			matcherDefs:    nil,
+			parentBlock:    sb.block,
+			groupCounter:   gc,
+			State:          state,
+			BlockState:     state,
+			directiveOrder: order,
 		}
 
 		handler, err := ParseSegmentAsSubroute(h)
@@ -537,6 +547,7 @@ func (st *ServerType) serversFromPairings(
 	options map[string]any,
 	warnings *[]caddyconfig.Warning,
 	groupCounter counter,
+	order []string,
 ) (map[string]*caddyhttp.Server, error) {
 	servers := make(map[string]*caddyhttp.Server)
 	defaultSNI := tryString(options["default_sni"], warnings)
@@ -869,7 +880,7 @@ func (st *ServerType) serversFromPairings(
 
 			// set up each handler directive, making sure to honor directive order
 			dirRoutes := sblock.pile["route"]
-			siteSubroute, err := buildSubroute(dirRoutes, groupCounter, true)
+			siteSubroute, err := buildSubroute(dirRoutes, groupCounter, true, order)
 			if err != nil {
 				return nil, err
 			}
@@ -1287,15 +1298,16 @@ func appendSubrouteToRouteList(routeList caddyhttp.RouteList,
 
 // buildSubroute turns the config values, which are expected to be routes
 // into a clean and orderly subroute that has all the routes within it.
-func buildSubroute(routes []ConfigValue, groupCounter counter, needsSorting bool) (*caddyhttp.Subroute, error) {
+// order is the directive ordering in effect for the current adaptation.
+func buildSubroute(routes []ConfigValue, groupCounter counter, needsSorting bool, order []string) (*caddyhttp.Subroute, error) {
 	if needsSorting {
 		for _, val := range routes {
-			if !slices.Contains(directiveOrder, val.directive) {
+			if !slices.Contains(order, val.directive) {
 				return nil, fmt.Errorf("directive '%s' is not an ordered HTTP handler, so it cannot be used here - try placing within a route block or using the order global option", val.directive)
 			}
 		}
 
-		sortRoutes(routes)
+		sortRoutes(routes, order)
 	}
 
 	subroute := new(caddyhttp.Subroute)

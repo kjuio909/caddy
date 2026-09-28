@@ -97,9 +97,12 @@ var defaultDirectiveOrder = []string{
 	"acme_server",
 }
 
-// directiveOrder specifies the order to apply directives
-// in HTTP routes, after being modified by either the
-// plugins or by the user via the "order" global option.
+// directiveOrder specifies the baseline order to apply directives in HTTP
+// routes, modified at init time by plugins via RegisterDirectiveOrder. It is
+// immutable after package initialization: the "order" global option produces
+// a per-adaptation order (stored in the adaptation's options and Helper)
+// instead of mutating this package variable, so concurrent adaptations never
+// share or leak directive ordering.
 var directiveOrder = defaultDirectiveOrder
 
 // RegisterDirective registers a unique directive dir with an
@@ -211,6 +214,33 @@ type Helper struct {
 	matcherDefs  map[string]caddy.ModuleMap
 	parentBlock  caddyfile.ServerBlock
 	groupCounter counter
+	// directiveOrder is the directive ordering in effect for this adaptation.
+	// It starts from the package baseline and is adjusted, per adaptation, by
+	// the "order" global option. It is never shared across adaptations.
+	directiveOrder []string
+}
+
+// directiveOrderForOptions returns the directive order in effect for an
+// adaptation given its options. The "order" global option stores the
+// per-adaptation order it computed; without it the registered package
+// baseline is used. This never reads or writes shared mutable state.
+func directiveOrderForOptions(options map[string]any) []string {
+	if options != nil {
+		if order, ok := options["order"].([]string); ok && len(order) > 0 {
+			return order
+		}
+	}
+	return directiveOrder
+}
+
+// effectiveDirectiveOrder returns the directive order for the current
+// adaptation, falling back to the registered package baseline when the
+// adaptation did not carry its own order.
+func (h Helper) effectiveDirectiveOrder() []string {
+	if len(h.directiveOrder) > 0 {
+		return h.directiveOrder
+	}
+	return directiveOrderForOptions(h.options)
 }
 
 // Option gets the option keyed by name.
@@ -347,7 +377,7 @@ func ParseSegmentAsSubroute(h Helper) (caddyhttp.MiddlewareHandler, error) {
 		return nil, err
 	}
 
-	return buildSubroute(allResults, h.groupCounter, true)
+	return buildSubroute(allResults, h.groupCounter, true, h.effectiveDirectiveOrder())
 }
 
 // parseSegmentAsConfig parses the segment such that its subdirectives
@@ -443,9 +473,9 @@ type ConfigValue struct {
 	directive string
 }
 
-func sortRoutes(routes []ConfigValue) {
+func sortRoutes(routes []ConfigValue, order []string) {
 	dirPositions := make(map[string]int)
-	for i, dir := range directiveOrder {
+	for i, dir := range order {
 		dirPositions[dir] = i
 	}
 
