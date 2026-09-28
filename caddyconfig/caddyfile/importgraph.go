@@ -17,6 +17,7 @@ package caddyfile
 import (
 	"fmt"
 	"slices"
+	"strings"
 )
 
 type adjacency map[string][]string
@@ -57,8 +58,14 @@ func (i *importGraph) addEdge(from, to string) error {
 		return fmt.Errorf("one of the nodes does not exist")
 	}
 
-	if i.willCycle(to, from) {
-		return fmt.Errorf("a cycle of imports exists between %s and %s", from, to)
+	if path, ok := i.pathBetween(to, from); ok {
+		// path runs from `to` back to `from`; appending `to`
+		// renders the complete closed loop. Edges are recorded in
+		// parse order and the search follows that order, so the same
+		// input always reports the same cycle sequence.
+		loop := append(append([]string{}, path...), to)
+		return fmt.Errorf("a cycle of imports exists between %s and %s: %s",
+			from, to, strings.Join(loop, " -> "))
 	}
 
 	if i.areConnected(from, to) {
@@ -95,29 +102,30 @@ func (i *importGraph) areConnected(from, to string) bool {
 	return slices.Contains(al, to)
 }
 
-func (i *importGraph) willCycle(from, to string) bool {
-	collector := make(map[string]bool)
-
-	var visit func(string)
-	visit = func(start string) {
-		if !collector[start] {
-			collector[start] = true
-			for _, v := range i.edges[start] {
-				visit(v)
+// pathBetween searches the recorded edges (in parse order) for a path
+// from start to target. The returned slice starts with start and ends
+// with target. Edges are appended while parsing, never reordered, so
+// the same input yields the same path across parses.
+func (i *importGraph) pathBetween(start, target string) ([]string, bool) {
+	var dfs func(string, []string) ([]string, bool)
+	dfs = func(node string, trail []string) ([]string, bool) {
+		trail = append(trail, node)
+		if node == target {
+			return trail, true
+		}
+		for _, next := range i.edges[node] {
+			// the graph is acyclic at this point (a cycle is what
+			// we are about to reject), so a trail guard is enough
+			if slices.Contains(trail, next) {
+				continue
+			}
+			if path, ok := dfs(next, trail); ok {
+				return path, true
 			}
 		}
+		return nil, false
 	}
-
-	for _, v := range i.edges[from] {
-		visit(v)
-	}
-	for k := range collector {
-		if to == k {
-			return true
-		}
-	}
-
-	return false
+	return dfs(start, nil)
 }
 
 func (i *importGraph) exists(key string) bool {
