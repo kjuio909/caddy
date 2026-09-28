@@ -29,6 +29,16 @@ type Adapter struct {
 }
 
 // Adapt converts the Caddyfile config in body to Caddy JSON.
+//
+// Adapt is safe to call concurrently on the same Adapter value, including
+// with a reused ServerType. Each invocation is independent: it owns its
+// parse, import expansion, and the warnings it returns, and it never shares
+// that state with another call. The filename identifying body must be
+// provided through options["filename"] (it defaults to "Caddyfile"); file
+// imports, including relative paths and globs, are resolved from that
+// file's tree. A failure returns a nil result together with an error whose
+// diagnostics reference only the file chain of that call, and it never
+// changes the outcome of earlier, concurrent, or later invocations.
 func (a Adapter) Adapt(body []byte, options map[string]any) ([]byte, []caddyconfig.Warning, error) {
 	if a.ServerType == nil {
 		return nil, nil, fmt.Errorf("no server type")
