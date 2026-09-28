@@ -9,4 +9,4 @@
 import import1
 
 ----------
-a cycle of imports exists between Caddyfile:import2 and Caddyfile:import1
+import cycle detected: Caddyfile:import1 -> Caddyfile:import2 -> Caddyfile:import1

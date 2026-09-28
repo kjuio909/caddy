@@ -38,8 +38,13 @@ type (
 
 	// Token represents a single parsable unit.
 	Token struct {
-		File          string
-		imports       []string
+		File    string
+		imports []string
+		// importChain holds the machine-readable keys of the nested
+		// import expansions (outermost first) that produced this token;
+		// it is used to detect active import cycles without any global
+		// state.
+		importChain   []string
 		Line          int
 		Text          string
 		wasQuoted     rune // enclosing quote character, if any
@@ -108,6 +113,7 @@ func (l *lexer) next() (bool, error) {
 	var val []rune
 	var comment, quoted, btQuoted, inHeredoc, heredocEscaped, escaped bool
 	var heredocMarker string
+	var quoteOpenLine int
 
 	makeToken := func(quoted rune) bool {
 		l.token.Text = string(val)
@@ -123,6 +129,13 @@ func (l *lexer) next() (bool, error) {
 		// If no EOF, then we had a problem.
 		ch, _, err := l.reader.ReadRune()
 		if err != nil {
+			if quoted || btQuoted {
+				quote := '"'
+				if btQuoted {
+					quote = '`'
+				}
+				return false, fmt.Errorf("unterminated quoted value on line #%d, expected closing %q", quoteOpenLine, quote)
+			}
 			if len(val) > 0 {
 				if inHeredoc {
 					return false, fmt.Errorf("incomplete heredoc <<%s on line #%d, expected ending marker %s", heredocMarker, l.line+l.skippedLines, heredocMarker)
@@ -272,10 +285,12 @@ func (l *lexer) next() (bool, error) {
 			l.token = Token{Line: l.line}
 			if ch == '"' {
 				quoted = true
+				quoteOpenLine = l.line
 				continue
 			}
 			if ch == '`' {
 				btQuoted = true
+				quoteOpenLine = l.line
 				continue
 			}
 		}
@@ -364,6 +379,7 @@ func (t Token) Clone() Token {
 	return Token{
 		File:          t.File,
 		imports:       append([]string{}, t.imports...),
+		importChain:   append([]string{}, t.importChain...),
 		Line:          t.Line,
 		Text:          t.Text,
 		wasQuoted:     t.wasQuoted,
