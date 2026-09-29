@@ -15,25 +15,40 @@
 package caddyfile
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
-	"io"
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 type (
 	// lexer is a utility which can get values, token by
-	// token, from a Reader. A token is a word, and tokens
-	// are separated by whitespace. A word can be enclosed
-	// in quotes if it contains whitespace.
+	// token, from an input byte slice. A token is a word,
+	// and tokens are separated by whitespace. A word can
+	// be enclosed in quotes if it contains whitespace.
 	lexer struct {
-		reader       *bufio.Reader
-		token        Token
+		// src is scanned positionally and never mutated;
+		// every invocation of Tokenize gets a fresh lexer.
+		src []byte
+		// pos is the byte offset of the next rune to read.
+		pos int
+
+		// line is the logical line counter used for token
+		// Line values; it preserves the historical behavior
+		// where escaped line continuations do not advance it.
 		line         int
 		skippedLines int
+
+		// physLine and physCol are the physical 1-based
+		// coordinates of the next rune in src, counting
+		// CRLF, a bare CR, and LF each as a single line
+		// break. They are used to report error positions.
+		physLine int
+		physCol  int
+
+		file  string
+		token Token
 	}
 
 	// Token represents a single parsable unit.
@@ -48,16 +63,49 @@ type (
 	}
 )
 
+// utf8BOM is the UTF-8 encoding of U+FEFF, the byte order mark.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
 // Tokenize takes bytes as input and lexes it into
 // a list of tokens that can be parsed as a Caddyfile.
 // Also takes a filename to fill the token's File as
 // the source of the tokens, which is important to
 // determine relative paths for `import` directives.
+//
+// To produce stable results across platforms and
+// editors, a single leading UTF-8 byte order mark is
+// consumed as a file marker, CRLF and bare CR line
+// endings are treated exactly like LF, and lexical
+// errors are reported with the given filename and a
+// definite line and column. The returned tokens do not
+// alias input, so mutating the input slice afterwards
+// has no effect on them.
 func Tokenize(input []byte, filename string) ([]Token, error) {
-	l := lexer{}
-	if err := l.load(bytes.NewReader(input)); err != nil {
-		return nil, err
+	src := input
+
+	// A byte order mark is only special in the leading
+	// position. A complete one is consumed silently; one
+	// cut off at end of input is malformed input; anywhere
+	// else in the file U+FEFF (or an unrelated EF-prefixed
+	// byte sequence) is ordinary content.
+	if len(src) > 0 && src[0] == utf8BOM[0] {
+		switch {
+		case len(src) >= len(utf8BOM) && src[1] == utf8BOM[1] && src[2] == utf8BOM[2]:
+			src = src[len(utf8BOM):]
+		case (len(src) == 1) || (len(src) == 2 && src[1] == utf8BOM[1]):
+			l := &lexer{file: filename}
+			return nil, l.errorf(1, 1, "incomplete UTF-8 byte order mark at beginning of file")
+		}
 	}
+
+	l := &lexer{
+		src:      src,
+		line:     1,
+		physLine: 1,
+		physCol:  1,
+		file:     filename,
+	}
+
 	var tokens []Token
 	for {
 		found, err := l.next()
@@ -73,25 +121,49 @@ func Tokenize(input []byte, filename string) ([]Token, error) {
 	return tokens, nil
 }
 
-// load prepares the lexer to scan an input for tokens.
-// It discards any leading byte order mark.
-func (l *lexer) load(input io.Reader) error {
-	l.reader = bufio.NewReader(input)
-	l.line = 1
-
-	// discard byte order mark, if present
-	firstCh, _, err := l.reader.ReadRune()
-	if err != nil {
-		return err
+// read decodes the next rune from the input and returns
+// it along with its physical 1-based line and column.
+// CRLF, a bare CR, and LF are all normalized to a single
+// '\n', so no carriage return ever reaches token text or
+// position accounting. Invalid bytes decode to
+// utf8.RuneError, matching utf8.DecodeRune. The boolean
+// result is false at end of input.
+func (l *lexer) read() (rune, int, int, bool) {
+	if l.pos >= len(l.src) {
+		return 0, l.physLine, l.physCol, false
 	}
-	if firstCh != 0xFEFF {
-		err := l.reader.UnreadRune()
-		if err != nil {
-			return err
+	line, col := l.physLine, l.physCol
+
+	if l.src[l.pos] == '\r' {
+		l.pos++
+		if l.pos < len(l.src) && l.src[l.pos] == '\n' {
+			l.pos++
 		}
+		l.physLine++
+		l.physCol = 1
+		return '\n', line, col, true
 	}
 
-	return nil
+	ch, size := utf8.DecodeRune(l.src[l.pos:])
+	l.pos += size
+	if ch == '\n' {
+		l.physLine++
+		l.physCol = 1
+	} else {
+		l.physCol++
+	}
+	return ch, line, col, true
+}
+
+// errorf reports a lexical error at the given physical
+// position, prefixed with the filename as provided by the
+// caller (never the working directory).
+func (l *lexer) errorf(line, col int, format string, args ...any) error {
+	message := fmt.Sprintf(format, args...)
+	if l.file != "" {
+		return fmt.Errorf("%s:%d:%d: %s", l.file, line, col, message)
+	}
+	return fmt.Errorf("line %d, column %d: %s", line, col, message)
 }
 
 // next loads the next token into the lexer.
@@ -109,8 +181,15 @@ func (l *lexer) next() (bool, error) {
 	var comment, quoted, btQuoted, inHeredoc, heredocEscaped, escaped bool
 	var heredocMarker string
 
+	// startLine is the logical line where the current
+	// token began; tokLine/tokCol are that position in
+	// physical coordinates, for unclosed-quote errors.
+	// escLine/escCol locate a pending backslash.
+	var startLine, tokLine, tokCol, escLine, escCol int
+
 	makeToken := func(quoted rune) bool {
 		l.token.Text = string(val)
+		l.token.Line = startLine
 		l.token.wasQuoted = quoted
 		l.token.heredocMarker = heredocMarker
 		return true
@@ -121,19 +200,28 @@ func (l *lexer) next() (bool, error) {
 		// read some characters, make a token. If we
 		// reached EOF, then no more tokens to read.
 		// If no EOF, then we had a problem.
-		ch, _, err := l.reader.ReadRune()
-		if err != nil {
-			if len(val) > 0 {
-				if inHeredoc {
-					return false, fmt.Errorf("incomplete heredoc <<%s on line #%d, expected ending marker %s", heredocMarker, l.line+l.skippedLines, heredocMarker)
-				}
+		ch, line, col, ok := l.read()
+		if !ok {
+			// structural errors are reported at the position
+			// where they began, and no partial token is
+			// returned alongside the error
+			if quoted {
+				return false, l.errorf(tokLine, tokCol, "unclosed quoted string: missing closing '\"'")
+			}
+			if btQuoted {
+				return false, l.errorf(tokLine, tokCol, "unclosed quoted string: missing closing '`'")
+			}
+			if escaped {
+				return false, l.errorf(escLine, escCol, "incomplete escape: dangling backslash at end of input")
+			}
+			if inHeredoc {
+				return false, fmt.Errorf("incomplete heredoc <<%s on line #%d, expected ending marker %s", heredocMarker, l.line+l.skippedLines, heredocMarker)
+			}
 
+			if len(val) > 0 {
 				return makeToken(0), nil
 			}
-			if err == io.EOF {
-				return false, nil
-			}
-			return false, err
+			return false, nil
 		}
 
 		// detect whether we have the start of a heredoc
@@ -144,15 +232,11 @@ func (l *lexer) next() (bool, error) {
 				return makeToken(0), nil
 			}
 
-			// skip CR, we only care about LF
-			if ch == '\r' {
-				continue
-			}
-
 			// after hitting a newline, we know that the heredoc marker
 			// is the characters after the two << and the newline.
 			// we reset the val because the heredoc is syntax we don't
 			// want to keep.
+			// (CR and CRLF have already been normalized to '\n'.)
 			if ch == '\n' {
 				if len(val) == 2 {
 					return false, fmt.Errorf("missing opening heredoc marker on line #%d; must contain only alphanumeric characters, dashes and underscores; got empty string", l.line)
@@ -164,7 +248,7 @@ func (l *lexer) next() (bool, error) {
 				}
 
 				heredocMarker = string(val[2:])
-				if !heredocMarkerRegexp.Match([]byte(heredocMarker)) {
+				if !heredocMarkerRegexp.MatchString(heredocMarker) {
 					return false, fmt.Errorf("heredoc marker on line #%d must contain only alphanumeric characters, dashes and underscores; got '%s'", l.line, heredocMarker)
 				}
 
@@ -188,10 +272,11 @@ func (l *lexer) next() (bool, error) {
 			// check if we're done, i.e. that the last few characters are the marker
 			if len(val) >= len(heredocMarker) && heredocMarker == string(val[len(val)-len(heredocMarker):]) {
 				// set the final value
-				val, err = l.finalizeHeredoc(val, heredocMarker)
+				finalVal, err := l.finalizeHeredoc(val, heredocMarker)
 				if err != nil {
 					return false, err
 				}
+				val = finalVal
 
 				// set the line counter, and make the token
 				l.line += l.skippedLines
@@ -206,7 +291,12 @@ func (l *lexer) next() (bool, error) {
 		// track whether we found an escape '\' for the next
 		// iteration to be contextually aware
 		if !escaped && !btQuoted && ch == '\\' {
+			if len(val) == 0 && !quoted {
+				startLine = l.line
+				tokLine, tokCol = line, col
+			}
 			escaped = true
+			escLine, escCol = line, col
 			continue
 		}
 
@@ -228,17 +318,16 @@ func (l *lexer) next() (bool, error) {
 				l.line += 1 + l.skippedLines
 				l.skippedLines = 0
 			}
-			// collect this character as part of the quoted token
+			// collect this character as part of the quoted token;
+			// line endings are already normalized, so quoted text
+			// is identical across LF, CRLF, and bare CR inputs
 			val = append(val, ch)
 			continue
 		}
 
 		if unicode.IsSpace(ch) {
-			// ignore CR altogether, we only actually care about LF (\n)
-			if ch == '\r' {
-				continue
-			}
-			// end of the line
+			// end of the line (carriage returns are normalized
+			// away at read time, so every line break is '\n')
 			if ch == '\n' {
 				// newlines can be escaped to chain arguments
 				// onto multiple lines; else, increment the line count
@@ -260,8 +349,9 @@ func (l *lexer) next() (bool, error) {
 		}
 
 		// comments must be at the start of a token,
-		// in other words, preceded by space or newline
-		if ch == '#' && len(val) == 0 {
+		// in other words, preceded by space or newline;
+		// a quoted or backslash-escaped '#' is content
+		if ch == '#' && len(val) == 0 && !escaped {
 			comment = true
 		}
 		if comment {
@@ -269,7 +359,8 @@ func (l *lexer) next() (bool, error) {
 		}
 
 		if len(val) == 0 {
-			l.token = Token{Line: l.line}
+			startLine = l.line
+			tokLine, tokCol = line, col
 			if ch == '"' {
 				quoted = true
 				continue
@@ -306,8 +397,8 @@ func (l *lexer) finalizeHeredoc(val []rune, marker string) ([]rune, error) {
 	// collapse the content, then split into separate lines
 	lines := strings.Split(stringVal[:lastNewline+1], "\n")
 
-	// figure out how much whitespace we need to strip from the front of every line
-	// by getting the string that precedes the marker, on the last line
+	// figure out how much whitespace we need to strip from the front of every
+	// line by getting the string that precedes the marker, on the last line
 	paddingToStrip := stringVal[lastNewline+1 : len(stringVal)-len(marker)]
 
 	// iterate over each line and strip the whitespace from the front
