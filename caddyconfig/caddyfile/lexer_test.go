@@ -15,6 +15,11 @@
 package caddyfile
 
 import (
+	"bytes"
+	"os"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -214,8 +219,111 @@ func TestLexer(t *testing.T) {
 		{
 			input: []byte("\xEF\xBB\xBF:8080"), // test with leading byte order mark
 			expected: []Token{
-				{Line: 1, Text: ":8080"},
+				{Line: 1, Column: 1, Text: ":8080"},
 			},
+		},
+		{
+			input: []byte("ab\xEF\xBB\xBFcd"), // a BOM anywhere else is ordinary content
+			expected: []Token{
+				{Line: 1, Column: 1, Text: "ab\uFEFFcd"},
+			},
+		},
+		{
+			input: []byte("a \xEF\xBB\xBF b"),
+			expected: []Token{
+				{Line: 1, Column: 1, Text: "a"},
+				{Line: 1, Column: 3, Text: "\uFEFF"},
+				{Line: 1, Column: 5, Text: "b"},
+			},
+		}, {
+			input: []byte("\xEF\xBB\xBF"), // a BOM alone is consumed, yielding no tokens
+		},
+		{
+			input:    []byte{}, // empty input yields an empty token sequence, no error
+			expected: []Token{},
+		},
+		{
+			input:    []byte("# a trailing backslash inside a comment is harmless\\\n"),
+			expected: []Token{},
+		},
+		{
+			input:        []byte("\xEF"), // truncated leading BOM: first byte only
+			expectErr:    true,
+			errorMessage: "Caddyfile:1:1: incomplete UTF-8 byte order mark at beginning of file",
+		},
+		{
+			input:        []byte("\xEF\xBB"), // truncated leading BOM: first two bytes
+			expectErr:    true,
+			errorMessage: "Caddyfile:1:1: incomplete UTF-8 byte order mark at beginning of file",
+		},
+		{
+			input: []byte("a\rb"), // lone CR is a line separator
+			expected: []Token{
+				{Line: 1, Column: 1, Text: "a"},
+				{Line: 2, Column: 1, Text: "b"},
+			},
+		},
+		{
+			input: []byte("host:8080 {\r\n\tdirective\r\n}"), // CRLF, just like the LF variant
+			expected: []Token{
+				{Line: 1, Column: 1, Text: "host:8080"},
+				{Line: 1, Column: 11, Text: "{"},
+				{Line: 2, Column: 2, Text: "directive"},
+				{Line: 3, Column: 1, Text: "}"},
+			},
+		},
+		{
+			input: []byte("ab cd\nef ghi"),
+			expected: []Token{
+				{Line: 1, Column: 1, Text: "ab"},
+				{Line: 1, Column: 4, Text: "cd"},
+				{Line: 2, Column: 1, Text: "ef"},
+				{Line: 2, Column: 4, Text: "ghi"},
+			},
+		},
+		{
+			input: []byte(`foo{}`), // adjacent braces stay part of the one unquoted token
+			expected: []Token{
+				{Line: 1, Column: 1, Text: "foo{}"},
+			},
+		},
+		{
+			input: []byte(`"a # b" # real comment`), // '#' inside quotes is not a comment
+			expected: []Token{
+				{Line: 1, Column: 1, Text: "a # b"},
+			},
+		},
+		{
+			input: []byte(`a \#b`), // an escaped '#' is literal text, not a comment
+			expected: []Token{
+				{Line: 1, Column: 1, Text: "a"},
+				{Line: 1, Column: 3, Text: `\#b`},
+			},
+		},
+		{
+			input:        []byte(`"abc`), // unclosed double-quoted string
+			expectErr:    true,
+			errorMessage: `Caddyfile:1:1: unclosed quoted string: missing closing "`,
+		},
+		{
+			input:        []byte("ab\n\"unclosed"), // error points at the opening quote
+			expectErr:    true,
+			errorMessage: "Caddyfile:2:1: unclosed quoted string: missing closing \"",
+		},
+		{
+			input:        []byte("`unclosed"), // unclosed backtick-quoted string
+			expectErr:    true,
+			errorMessage: "Caddyfile:1:1: unclosed quoted string: missing closing `",
+		},
+		{
+			input:        []byte(`abc\`), // dangling escape at end of file
+			expectErr:    true,
+			errorMessage: "Caddyfile:1:4: dangling backslash escape: no character follows",
+		},
+		{
+			input:        []byte("ab\r\n\\"), // dangling escape after a CRLF line ending
+			expectErr:    true,
+			errorMessage: "Caddyfile:2:1: dangling backslash escape: no character follows",
 		},
 		{
 			input: []byte("simple `backtick quoted` string"),
@@ -424,7 +532,7 @@ EOF
 		{
 			input:        []byte("not-a-heredoc <<\n"),
 			expectErr:    true,
-			errorMessage: "missing opening heredoc marker on line #1; must contain only alphanumeric characters, dashes and underscores; got empty string",
+			errorMessage: "Caddyfile:1:15: missing opening heredoc marker on line #1; must contain only alphanumeric characters, dashes and underscores; got empty string",
 		},
 		{
 			input: []byte(`heredoc <<<EOF
@@ -432,14 +540,14 @@ EOF
 	EOF same-line-arg
 	`),
 			expectErr:    true,
-			errorMessage: "too many '<' for heredoc on line #1; only use two, for example <<END",
+			errorMessage: "Caddyfile:1:9: too many '<' for heredoc on line #1; only use two, for example <<END",
 		},
 		{
 			input: []byte(`heredoc <<EOF
 	content
 	`),
 			expectErr:    true,
-			errorMessage: "incomplete heredoc <<EOF on line #3, expected ending marker EOF",
+			errorMessage: "Caddyfile:1:9: incomplete heredoc <<EOF on line #3, expected ending marker EOF",
 		},
 		{
 			input: []byte(`heredoc <<EOF
@@ -447,7 +555,7 @@ EOF
 		EOF
 	`),
 			expectErr:    true,
-			errorMessage: "mismatched leading whitespace in heredoc <<EOF on line #2 [\tcontent], expected whitespace [\t\t] to match the closing marker",
+			errorMessage: "Caddyfile:2:1: mismatched leading whitespace in heredoc <<EOF on line #2 [\tcontent], expected whitespace [\t\t] to match the closing marker",
 		},
 		{
 			input: []byte(`heredoc <<EOF
@@ -455,7 +563,7 @@ EOF
 		EOF
 	`),
 			expectErr:    true,
-			errorMessage: "mismatched leading whitespace in heredoc <<EOF on line #2 [        content], expected whitespace [\t\t] to match the closing marker",
+			errorMessage: "Caddyfile:2:1: mismatched leading whitespace in heredoc <<EOF on line #2 [        content], expected whitespace [\t\t] to match the closing marker",
 		},
 		{
 			input: []byte(`heredoc <<EOF
@@ -497,12 +605,12 @@ EOF`),
 		The previous line is a blank line with one tab less than the correct indentation
 		EOF`),
 			expectErr:    true,
-			errorMessage: "mismatched leading whitespace in heredoc <<EOF on line #3 [\t], expected whitespace [\t\t] to match the closing marker",
+			errorMessage: "Caddyfile:3:1: mismatched leading whitespace in heredoc <<EOF on line #3 [\t], expected whitespace [\t\t] to match the closing marker",
 		},
 	}
 
 	for i, testCase := range testCases {
-		actual, err := Tokenize(testCase.input, "")
+		actual, err := Tokenize(testCase.input, "Caddyfile")
 		if testCase.expectErr {
 			if err == nil {
 				t.Fatalf("expected error, got actual: %v", actual)
@@ -532,10 +640,255 @@ func lexerCompare(t *testing.T, n int, expected, actual []Token) {
 				n, i, expected[i].Text, expected[i].Line, actual[i].Line)
 			break
 		}
+		if expected[i].Column != 0 && actual[i].Column != expected[i].Column {
+			t.Fatalf("Test case %d token %d ('%s'): expected column %d but was column %d",
+				n, i, expected[i].Text, expected[i].Column, actual[i].Column)
+			break
+		}
 		if actual[i].Text != expected[i].Text {
 			t.Fatalf("Test case %d token %d: expected text '%s' but was '%s'",
 				n, i, expected[i].Text, actual[i].Text)
 			break
+		}
+	}
+}
+
+// encodeNewlines returns in with every LF replaced by the given
+// line ending, so the same logical text can be lexed under the
+// different encodings files acquire across platforms and editors.
+func encodeNewlines(in, eol []byte) []byte {
+	return bytes.ReplaceAll(in, []byte{'\n'}, eol)
+}
+
+// tokenSignature is the observable result of Tokenize: the token
+// text, order and positions only; the File is verified separately.
+type tokenSignature struct {
+	Line   int
+	Column int
+	Text   string
+}
+
+func signatures(tokens []Token) []tokenSignature {
+	sig := make([]tokenSignature, len(tokens))
+	for i, tok := range tokens {
+		sig[i] = tokenSignature{Line: tok.Line, Column: tok.Column, Text: tok.Text}
+	}
+	return sig
+}
+
+// TestLexerLineEndingEquivalence verifies that the same logical
+// configuration yields identical token text, order and positions
+// whether it uses LF, CRLF, or lone CR line endings, including in
+// comments, quoted strings, escaped line continuations and heredocs.
+func TestLexerLineEndingEquivalence(t *testing.T) {
+	logical := []byte("host:8080 {\n" +
+		"  # a comment should be ignored\n" +
+		"  directive arg \\\n" +
+		"    continued\n" +
+		"  quoted \"a b\nc\"\n" +
+		"  heredoc <<EOF\n" +
+		"  body\n" +
+		"  EOF tail\n" +
+		"}\n")
+
+	encodings := map[string][]byte{
+		"LF":   {'\n'},
+		"CRLF": {'\r', '\n'},
+		"CR":   {'\r'},
+	}
+
+	var reference []tokenSignature
+	for name, eol := range encodings {
+		input := encodeNewlines(logical, eol)
+		tokens, err := Tokenize(input, "Caddyfile")
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", name, err)
+		}
+		for _, tok := range tokens {
+			if strings.ContainsRune(tok.Text, '\r') {
+				t.Fatalf("%s: token %q retains a carriage return", name, tok.Text)
+			}
+		}
+		sig := signatures(tokens)
+		if reference == nil {
+			reference = sig
+			continue
+		}
+		if !reflect.DeepEqual(reference, sig) {
+			t.Fatalf("%s encoding produced different tokens:\nLF:  %v\n%s: %v", name, reference, name, sig)
+		}
+	}
+}
+
+// TestLexerLeadingBOMNormalized ensures a leading BOM is consumed
+// silently under every line ending encoding and never becomes the
+// first token, while BOMs elsewhere are preserved verbatim.
+func TestLexerLeadingBOMNormalized(t *testing.T) {
+	for _, eol := range [][]byte{{'\n'}, {'\r', '\n'}, {'\r'}} {
+		input := append([]byte{0xEF, 0xBB, 0xBF}, encodeNewlines([]byte(":8080\nroot"), eol)...)
+		tokens, err := Tokenize(input, "Caddyfile")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tokens) != 2 || tokens[0].Text != ":8080" {
+			t.Fatalf("leading BOM should be consumed, got %v", tokens)
+		}
+	}
+
+	// a BOM after other content is ordinary text, even when quoted
+	for _, in := range [][]byte{
+		[]byte("a \xEF\xBB\xBF b"),
+		[]byte("\"\xEF\xBB\xBF\""),
+	} {
+		tokens, err := Tokenize(in, "Caddyfile")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var found bool
+		for _, tok := range tokens {
+			if strings.ContainsRune(tok.Text, '\uFEFF') {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("non-leading BOM must be preserved as content, got %v", tokens)
+		}
+	}
+}
+
+// TestLexerErrorsCarryPositionAndFile checks that lexical failures
+// report the filename exactly as passed and the first definite line
+// and column, independent of the working directory, and that no
+// partial token sequence is returned alongside an error.
+func TestLexerErrorsCarryPositionAndFile(t *testing.T) {
+	cwd, _ := os.Getwd()
+	defer os.Chdir(cwd)
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		input   []byte
+		file    string
+		wantErr string
+	}{
+		{[]byte(`ab "x`), "relative/Caddyfile", "relative/Caddyfile:1:4: unclosed quoted string: missing closing \""},
+		{[]byte("x\n `q"), "/abs/path/Caddyfile", "/abs/path/Caddyfile:2:2: unclosed quoted string: missing closing `"},
+		{[]byte("a\\"), "Caddyfile", "Caddyfile:1:2: dangling backslash escape: no character follows"},
+		{[]byte("\xEF\xBB"), "Caddyfile", "Caddyfile:1:1: incomplete UTF-8 byte order mark at beginning of file"},
+	} {
+		tokens, err := Tokenize(tc.input, tc.file)
+		if err == nil {
+			t.Fatalf("expected error for %q, got tokens %v", tc.input, tokens)
+		}
+		if err.Error() != tc.wantErr {
+			t.Fatalf("expected error %q, got %q", tc.wantErr, err.Error())
+		}
+		if tokens != nil {
+			t.Fatalf("error result must not yield traversable tokens, got %v", tokens)
+		}
+	}
+}
+
+// TestTokenizeBufferIndependence verifies a successful result does
+// not alias the caller's input buffer: mutating the input after the
+// call leaves the returned tokens untouched.
+func TestTokenizeBufferIndependence(t *testing.T) {
+	input := []byte("host:8080 {\n\tdirective\n}")
+	tokens, err := Tokenize(input, "Caddyfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := signatures(tokens)
+
+	for i := range input {
+		input[i] = 'X'
+	}
+
+	tokens2, err := Tokenize([]byte("host:8080 {\n\tdirective\n}"), "Caddyfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(want, signatures(tokens)) {
+		t.Fatalf("mutating the input buffer changed earlier results:\n%v", signatures(tokens))
+	}
+	if !reflect.DeepEqual(want, signatures(tokens2)) {
+		t.Fatalf("results are not repeatable across calls:\n%v\n%v", want, signatures(tokens2))
+	}
+}
+
+// TestTokenizeCallIsolation checks that a failed call leaves no
+// residue: immediately tokenizing valid text (even reusing the same
+// backing array), then failing again, each produces its own result.
+func TestTokenizeCallIsolation(t *testing.T) {
+	bad := []byte(`"never closed`)
+	if _, err := Tokenize(bad, "Caddyfile"); err == nil {
+		t.Fatal("expected an error for unclosed quote")
+	}
+
+	// a fresh, independent buffer holding valid input right after
+	// the failure must not inherit any state from the failed call
+	good := []byte("good input")
+	tokens, err := Tokenize(good, "Caddyfile")
+	if err != nil {
+		t.Fatalf("valid input after a failure should succeed, got: %v", err)
+	}
+	if len(tokens) != 2 || tokens[0].Text != "good" || tokens[1].Text != "input" {
+		t.Fatalf("unexpected tokens after prior failure: %v", tokens)
+	}
+
+	// reusing the original failing input repeats the same failure
+	if _, err := Tokenize(bad, "Caddyfile"); err == nil {
+		t.Fatal("expected the same failure to repeat")
+	}
+
+	// and valid input tokenized twice yields identical results
+	again, err := Tokenize(good, "Caddyfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(tokens, again) {
+		t.Fatalf("repeated valid calls differ:\n%v\n%v", tokens, again)
+	}
+}
+
+// TestTokenizeConcurrent runs many goroutines over one shared input
+// and asserts every call returns byte-identical tokens or the same
+// error, with no shared mutable state leaking between calls.
+func TestTokenizeConcurrent(t *testing.T) {
+	cases := [][]byte{
+		[]byte("host:8080 {\n\tdirective arg\n}\n"),
+		[]byte("\"unclosed"),
+		[]byte("\xEF\xBB"),
+	}
+	const n = 64
+
+	for _, input := range cases {
+		var wg sync.WaitGroup
+		results := make([][]Token, n)
+		errs := make([]error, n)
+		start := make(chan struct{})
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				results[i], errs[i] = Tokenize(input, "Caddyfile")
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		for i := 1; i < n; i++ {
+			if (errs[0] == nil) != (errs[i] == nil) {
+				t.Fatalf("case %q: call 0 erred=%v, call %d erred=%v", input, errs[0], i, errs[i])
+			}
+			if errs[0] != nil && errs[0].Error() != errs[i].Error() {
+				t.Fatalf("case %q: errors differ: %q vs %q", input, errs[0], errs[i])
+			}
+			if !reflect.DeepEqual(results[0], results[i]) {
+				t.Fatalf("case %q: token results differ between concurrent calls", input)
+			}
 		}
 	}
 }
