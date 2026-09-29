@@ -87,11 +87,17 @@ func (st ServerType) Setup(
 	}
 
 	// Resolve the directive order for this adaptation. The "order" global
-	// option stores a per-adaptation order in options; we read it here once
-	// and thread it through every Helper and subroute build below. This keeps
-	// the ordering local to the call even when one Adapter is shared by
-	// concurrent adaptations.
-	adaptDirectiveOrder := directiveOrderForOptions(options)
+	// option accumulates per-adaptation constraints in options; merge them
+	// with the registered baseline once here, after the whole global
+	// options block has been read, and thread the result through every
+	// top-level Helper and subroute build below. Contradictory or cyclic
+	// constraints fail the whole adaptation. This keeps the ordering local
+	// to the call even when one Adapter is shared by concurrent
+	// adaptations.
+	adaptDirectiveOrder, err := directiveOrderForOptions(options)
+	if err != nil {
+		return nil, warnings, err
+	}
 
 	// this will replace both static and user-defined placeholder shorthands
 	// with actual identifiers used by Caddy
@@ -376,6 +382,11 @@ func (st ServerType) Setup(
 // keys. It returns the updated list of server blocks with the
 // global options block removed, and updates options accordingly.
 func (ServerType) evaluateGlobalOptionsBlock(serverBlocks []serverBlock, options map[string]any) ([]serverBlock, error) {
+	// "order" constraints accumulate only from this adaptation; clear any
+	// value a caller-provided options map may carry from a previous call
+	// so a reused map can never leak one adaptation's ordering into another
+	delete(options, "order")
+
 	if len(serverBlocks) == 0 || len(serverBlocks[0].block.Keys) > 0 {
 		return serverBlocks, nil
 	}
@@ -518,7 +529,7 @@ func (ServerType) extractNamedRoutes(
 			directiveOrder: order,
 		}
 
-		handler, err := ParseSegmentAsSubroute(h)
+		handler, err := parseSegmentAsSubrouteWithOrder(h, order)
 		if err != nil {
 			return nil, err
 		}

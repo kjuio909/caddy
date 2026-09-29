@@ -16,6 +16,8 @@ package httpcaddyfile
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"maps"
 	"net"
 	"slices"
@@ -99,10 +101,11 @@ var defaultDirectiveOrder = []string{
 
 // directiveOrder specifies the baseline order to apply directives in HTTP
 // routes, modified at init time by plugins via RegisterDirectiveOrder. It is
-// immutable after package initialization: the "order" global option produces
-// a per-adaptation order (stored in the adaptation's options and Helper)
-// instead of mutating this package variable, so concurrent adaptations never
-// share or leak directive ordering.
+// immutable after package initialization: the "order" global option only
+// accumulates per-adaptation constraints (stored in the adaptation's options
+// and Helper) which are merged with this baseline into a fresh order for
+// that adaptation, so concurrent adaptations never share or leak directive
+// ordering.
 var directiveOrder = defaultDirectiveOrder
 
 // RegisterDirective registers a unique directive dir with an
@@ -214,38 +217,542 @@ type Helper struct {
 	matcherDefs  map[string]caddy.ModuleMap
 	parentBlock  caddyfile.ServerBlock
 	groupCounter counter
-	// directiveOrder is the directive ordering in effect for this adaptation.
-	// It starts from the package baseline and is adjusted, per adaptation, by
-	// the "order" global option. It is never shared across adaptations.
+	// directiveOrder is the directive ordering in effect for this Helper's
+	// scope. The site's top-level chain uses the per-adaptation order merged
+	// from the "order" global option; nested scopes (route, handle and other
+	// subroutes) use the registered baseline, since outer ordering must not
+	// rearrange items within a nested handler. It is never shared across
+	// adaptations.
 	directiveOrder []string
 }
 
-// directiveOrderForOptions returns the directive order in effect for an
-// adaptation given its options. The "order" global option stores the
-// per-adaptation order it computed; without it the registered package
-// baseline is used. This never reads or writes shared mutable state.
-func directiveOrderForOptions(options map[string]any) []string {
-	if options != nil {
-		if order, ok := options["order"].([]string); ok && len(order) > 0 {
-			return order
-		}
-	}
-	return directiveOrder
+// orderConstraint is one relative-position declaration from the "order"
+// global option: dir is the directive being placed; pos is Before, After,
+// First or Last; otherDir is the directive it is placed relative to (empty
+// for First and Last). File and Line locate the declaration for errors.
+type orderConstraint struct {
+	dir      string
+	pos      Positional
+	otherDir string
+	file     string
+	line     int
 }
 
-// effectiveDirectiveOrder returns the directive order for the current
-// adaptation, falling back to the registered package baseline when the
-// adaptation did not carry its own order.
-func (h Helper) effectiveDirectiveOrder() []string {
-	if len(h.directiveOrder) > 0 {
-		return h.directiveOrder
+// orderConstraints is the set of "order" declarations collected for one
+// adaptation, in the order they were written.
+type orderConstraints []orderConstraint
+
+// directiveOrderForOptions returns the directive order in effect for an
+// adaptation given its options. The "order" global option accumulates the
+// adaptation's constraints; they are merged with the registered baseline
+// into a fresh order by a stable topological sort. Without constraints the
+// registered baseline is used. This never reads or writes shared mutable
+// state.
+func directiveOrderForOptions(options map[string]any) ([]string, error) {
+	if options != nil {
+		if constraints, ok := options["order"].(orderConstraints); ok && len(constraints) > 0 {
+			return resolveDirectiveOrder(directiveOrder, constraints)
+		}
 	}
-	return directiveOrderForOptions(h.options)
+	return directiveOrder, nil
+}
+
+// orderEdge is a directed ordering relation from one directive to another.
+type orderEdge struct{ from, to string }
+
+// resolveDirectiveOrder merges the baseline directive order with the
+// before/after/first/last constraints of one adaptation into a single stable
+// order. The constraints form a directed graph of user declarations only;
+// the baseline is not part of that graph, it only supplies the traversal
+// order. Baseline directives are emitted in their default order, but before
+// a directive is emitted every directive constrained to run before it is
+// pulled up recursively, so a reordered directive lands adjacent to its
+// anchor (like a single insertion) while transitive constraints are honored.
+// Because graph construction never depends on the sequence in which the
+// constraints were collected, swapping declaration lines, import traversal
+// order or glob order cannot change the result as long as the constraint
+// set is equivalent. Directives unrelated to the constraints keep their
+// default positions.
+func resolveDirectiveOrder(baseline []string, constraints orderConstraints) ([]string, error) {
+	// rank of each node in the baseline; directives absent from the
+	// baseline (handler plugins without a registered default position)
+	// sort after all baseline directives and tiebreak lexicographically,
+	// so their placement never depends on declaration order
+	baselineSet := make(map[string]struct{}, len(baseline))
+	for _, dir := range baseline {
+		baselineSet[dir] = struct{}{}
+	}
+	for _, c := range constraints {
+		if _, ok := baselineSet[c.dir]; !ok {
+			baselineSet[c.dir] = struct{}{}
+		}
+		if c.otherDir != "" {
+			if _, ok := baselineSet[c.otherDir]; !ok {
+				baselineSet[c.otherDir] = struct{}{}
+			}
+		}
+	}
+	rank := make(map[string]int, len(baselineSet))
+	for i, dir := range baseline {
+		rank[dir] = i
+	}
+	var extras []string
+	for dir := range baselineSet {
+		if _, ok := rank[dir]; ok {
+			continue
+		}
+		extras = append(extras, dir)
+	}
+	sort.Strings(extras)
+	for i, dir := range extras {
+		rank[dir] = len(baseline) + i
+	}
+	nodes := make([]string, 0, len(baselineSet))
+	for dir := range baselineSet {
+		nodes = append(nodes, dir)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return rank[nodes[i]] < rank[nodes[j]] })
+
+	// every user-declared edge remembers its first declaration; this makes
+	// contradictions locatable
+	origin := make(map[orderEdge]orderConstraint)
+	constraintText := func(c orderConstraint) string {
+		if c.otherDir != "" {
+			return fmt.Sprintf("%s %s %s", c.dir, c.pos, c.otherDir)
+		}
+		return fmt.Sprintf("%s %s", c.dir, c.pos)
+	}
+	addEdge := func(from, to string, c orderConstraint) error {
+		e := orderEdge{from, to}
+		if _, ok := origin[e]; ok {
+			// the same relation, possibly declared again, is idempotent
+			return nil
+		}
+		if reverse, ok := origin[orderEdge{to, from}]; ok {
+			return fmt.Errorf("%s:%d: conflicting order constraints for directives '%s' and '%s': %q (here) contradicts %q (at %s:%d)",
+				c.file, c.line, from, to, constraintText(c), constraintText(reverse), reverse.file, reverse.line)
+		}
+		origin[e] = c
+		return nil
+	}
+
+	// first/last constraints fix a section rather than a single neighbor;
+	// track their subjects separately (with their declarations, for
+	// locatable errors) so the adjacency pass only walks the one-anchor
+	// before/after edges
+	firstDirs := make(map[string]struct{})
+	lastDirs := make(map[string]struct{})
+	firstDecl := make(map[string]orderConstraint)
+	lastDecl := make(map[string]orderConstraint)
+
+	// pass 1: one-anchor before/after edges, plus collect section subjects.
+	// Sections are expanded in pass 2 once all single edges are known.
+	for _, c := range constraints {
+		switch c.pos {
+		case Before, After:
+			// a directive ordered relative to itself imposes no relation;
+			// ignore it rather than reading it as a self-loop cycle
+			if c.dir == c.otherDir {
+				continue
+			}
+			if c.pos == Before {
+				if err := addEdge(c.dir, c.otherDir, c); err != nil {
+					return nil, err
+				}
+			} else {
+				if err := addEdge(c.otherDir, c.dir, c); err != nil {
+					return nil, err
+				}
+			}
+		case First:
+			firstDirs[c.dir] = struct{}{}
+			if _, seen := firstDecl[c.dir]; !seen {
+				firstDecl[c.dir] = c
+			}
+		case Last:
+			lastDirs[c.dir] = struct{}{}
+			if _, seen := lastDecl[c.dir]; !seen {
+				lastDecl[c.dir] = c
+			}
+		default:
+			return nil, fmt.Errorf("%s:%d: unknown positional '%s'", c.file, c.line, c.pos)
+		}
+	}
+
+	// adjacency of the one-anchor edges; a directive constrained before a
+	// first-section directive belongs to the first section too, and one
+	// constrained after a last-section directive belongs to the last
+	singleSucc := make(map[string][]string)
+	singlePred := make(map[string][]string)
+	recordSingle := func(from, to string) {
+		singleSucc[from] = append(singleSucc[from], to)
+		singlePred[to] = append(singlePred[to], from)
+	}
+	// origin maps user edges to their declarations; edges originating from
+	// before/after constraints are exactly the ones with a non-empty anchor
+	for e, c := range origin {
+		if c.otherDir != "" {
+			recordSingle(e.from, e.to)
+		}
+	}
+	firstSet := closureSection(firstDirs, singlePred)
+	lastSet := closureSection(lastDirs, singleSucc)
+
+	// a directive cannot belong to both end sections: that would require it
+	// to run before everything and after everything at once
+	if overlap := lowestRanked(firstSet, lastSet, rank); overlap != "" {
+		firstSeed, lastSeed := reachingSeed(overlap, firstDirs, singlePred), reachingSeed(overlap, lastDirs, singleSucc)
+		fc, lc := firstDecl[firstSeed], lastDecl[lastSeed]
+		return nil, fmt.Errorf("%s:%d: conflicting order constraints around directive '%s': %s %s (at %s:%d) forces it to the front but %s %s (at %s:%d) forces it to the back",
+			lc.file, lc.line, overlap, fc.dir, fc.pos, fc.file, fc.line, lc.dir, lc.pos, lc.file, lc.line)
+	}
+
+	// pass 2: fan-out edges for section subjects, skipping members of the
+	// subject's own section (two "first" directives are mutually
+	// unconstrained and rank-tiebreak instead). A reverse edge here means
+	// the section contradicts a before/after declaration.
+	for _, c := range constraints {
+		switch c.pos {
+		case First:
+			for _, node := range nodes {
+				if node == c.dir {
+					continue
+				}
+				if _, inSection := firstSet[node]; inSection {
+					continue
+				}
+				if err := addEdge(c.dir, node, c); err != nil {
+					return nil, err
+				}
+			}
+		case Last:
+			for _, node := range nodes {
+				if node == c.dir {
+					continue
+				}
+				if _, inSection := lastSet[node]; inSection {
+					continue
+				}
+				if err := addEdge(node, c.dir, c); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	// build adjacency lists and in-degrees from the full user graph
+	succ := make(map[string][]string, len(nodes))
+	indeg := make(map[string]int, len(nodes))
+	for _, node := range nodes {
+		indeg[node] = 0
+	}
+	for e := range origin {
+		succ[e.from] = append(succ[e.from], e.to)
+		indeg[e.to]++
+	}
+	rankLess := func(a, b string) bool { return rank[a] < rank[b] }
+	for n := range succ {
+		sort.Slice(succ[n], func(i, j int) bool { return rankLess(succ[n][i], succ[n][j]) })
+		sort.Slice(singleSucc[n], func(i, j int) bool { return rankLess(singleSucc[n][i], singleSucc[n][j]) })
+		sort.Slice(singlePred[n], func(i, j int) bool { return rankLess(singlePred[n][i], singlePred[n][j]) })
+	}
+
+	// reject cycles before emitting; a graph with a cycle has no valid order
+	remaining := make(map[string]int, len(nodes))
+	for node, d := range indeg {
+		remaining[node] = d
+	}
+	queue := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if remaining[node] == 0 {
+			queue = append(queue, node)
+		}
+	}
+	visited := 0
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		visited++
+		for _, next := range succ[cur] {
+			remaining[next]--
+			if remaining[next] == 0 {
+				queue = append(queue, next)
+			}
+		}
+	}
+	if visited != len(nodes) {
+		return nil, orderCycleError(nodes, succ, remaining, rankLess, origin)
+	}
+
+	// emit the three sections in order: first, middle, last. Within each
+	// section nodes are produced by the same baseline-driven, constraint-
+	// adjacent walk, restricted to the section; unconstrained members of a
+	// section tiebreak by baseline rank, so two "first" or two "last"
+	// directives are stable and never depend on declaration order.
+	emitted := make(map[string]bool, len(nodes))
+	ordered := make([]string, 0, len(nodes))
+
+	allSinglePredsEmitted := func(node string) bool {
+		for _, prerequisite := range singlePred[node] {
+			if !emitted[prerequisite] {
+				return false
+			}
+		}
+		return true
+	}
+	var visit func(string, map[string]bool)
+	visit = func(node string, allowed map[string]bool) {
+		// mark on entry: a prerequisite pull followed by a push-down can
+		// re-enter this same node before its outer call has finished
+		if emitted[node] || !allowed[node] {
+			return
+		}
+		emitted[node] = true
+		for _, prerequisite := range singlePred[node] {
+			visit(prerequisite, allowed)
+		}
+		ordered = append(ordered, node)
+		for _, successor := range singleSucc[node] {
+			// only place an "after" subject once every one of its anchors
+			// has been emitted, or pulling it here would drag a later
+			// anchor out of position
+			if !emitted[successor] && allowed[successor] && allSinglePredsEmitted(successor) {
+				visit(successor, allowed)
+			}
+		}
+	}
+
+	emitSection := func(set map[string]struct{}) {
+		allowed := make(map[string]bool, len(set))
+		var members []string
+		for dir := range set {
+			allowed[dir] = true
+			members = append(members, dir)
+		}
+		sort.Slice(members, func(i, j int) bool { return rankLess(members[i], members[j]) })
+		for _, dir := range members {
+			visit(dir, allowed)
+		}
+	}
+
+	emitSection(firstSet)
+
+	middle := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		if _, inFirst := firstSet[node]; inFirst {
+			continue
+		}
+		if _, inLast := lastSet[node]; inLast {
+			continue
+		}
+		middle[node] = true
+	}
+	for _, node := range nodes {
+		visit(node, middle)
+	}
+
+	emitSection(lastSet)
+
+	return ordered, nil
+}
+
+// closureSection expands a set of section subjects: following neighbors
+// turns every directive transitively tied into the section into a member.
+// The first section pulls in directives constrained before its subjects
+// (predecessors); the last section pulls in directives constrained after
+// its subjects (successors).
+func closureSection(seeds map[string]struct{}, neighbors map[string][]string) map[string]struct{} {
+	set := make(map[string]struct{}, len(seeds))
+	var stack []string
+	for seed := range seeds {
+		set[seed] = struct{}{}
+		stack = append(stack, seed)
+	}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, next := range neighbors[cur] {
+			if _, ok := set[next]; ok {
+				continue
+			}
+			set[next] = struct{}{}
+			stack = append(stack, next)
+		}
+	}
+	return set
+}
+
+// lowestRanked returns the lowest-ranked directive present in both sets, or
+// "" when the sets are disjoint.
+func lowestRanked(a, b map[string]struct{}, rank map[string]int) string {
+	overlap := ""
+	for dir := range a {
+		if _, ok := b[dir]; !ok {
+			continue
+		}
+		if overlap == "" || rank[dir] < rank[overlap] {
+			overlap = dir
+		}
+	}
+	return overlap
+}
+
+// reachingSeed returns the lowest-ranked seed from which target is
+// reachable through neighbors. Callers guarantee such a seed exists.
+func reachingSeed(target string, seeds map[string]struct{}, neighbors map[string][]string) string {
+	found := ""
+	for seed := range seeds {
+		seen := map[string]bool{seed: true}
+		stack := []string{seed}
+		reachable := false
+		for len(stack) > 0 {
+			cur := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if cur == target {
+				reachable = true
+				break
+			}
+			for _, next := range neighbors[cur] {
+				if !seen[next] {
+					seen[next] = true
+					stack = append(stack, next)
+				}
+			}
+		}
+		if reachable && (found == "" || seed < found) {
+			found = seed
+		}
+	}
+	return found
+}
+
+// orderCycleError builds a deterministic, locatable error for a cycle in the
+// ordering graph. Nodes still carrying a positive in-degree after a Kahn pass
+// comprise the cycles plus everything downstream of them; downstream nodes
+// are peeled off from the sinks until only cycle nodes remain. The reported
+// walk then starts at the lowest-ranked cycle node and follows
+// lowest-ranked successors until it returns to that node, and names the user
+// declarations (file:line) that supply the walked edges.
+func orderCycleError(
+	nodes []string,
+	succ map[string][]string,
+	remaining map[string]int,
+	rankLess func(a, b string) bool,
+	origin map[orderEdge]orderConstraint,
+) error {
+	onCycle := make(map[string]bool)
+	for node, deg := range remaining {
+		if deg > 0 {
+			onCycle[node] = true
+		}
+	}
+	// peel off nodes downstream of the cycle(s): a remaining node with no
+	// remaining successor cannot itself be on a cycle
+	for {
+		var sink string
+		for node := range onCycle {
+			hasCycleSucc := false
+			for _, next := range succ[node] {
+				if onCycle[next] {
+					hasCycleSucc = true
+					break
+				}
+			}
+			if !hasCycleSucc {
+				sink = node
+				break
+			}
+		}
+		if sink == "" {
+			break
+		}
+		delete(onCycle, sink)
+	}
+
+	start := ""
+	for _, node := range nodes {
+		if onCycle[node] && (start == "" || rankLess(node, start)) {
+			start = node
+		}
+	}
+
+	// deterministic walk; it may close on a node other than the start when
+	// several cycles share nodes, in which case rotate to the repeated node
+	walk := []string{start}
+	var walked []orderEdge
+	index := map[string]int{start: 0}
+	cur := start
+	for {
+		next := ""
+		for _, candidate := range succ[cur] {
+			if !onCycle[candidate] {
+				continue
+			}
+			if next == "" || rankLess(candidate, next) {
+				next = candidate
+			}
+		}
+		walked = append(walked, orderEdge{cur, next})
+		if at, repeated := index[next]; repeated {
+			walk = append(walk, next)
+			walk = walk[at:]
+			walked = walked[at:]
+			break
+		}
+		index[next] = len(walk)
+		walk = append(walk, next)
+		cur = next
+	}
+
+	var locs []string
+	seen := make(map[orderEdge]bool)
+	for _, e := range walked {
+		if seen[e] {
+			continue
+		}
+		seen[e] = true
+		if c, ok := origin[e]; ok {
+			locs = append(locs, fmt.Sprintf("%s:%d", c.file, c.line))
+		}
+	}
+	sort.Strings(locs)
+	msg := "cyclic order constraint detected: " + strings.Join(walk, " -> ")
+	if len(locs) > 0 {
+		msg += " (declared at " + strings.Join(locs, ", ") + ")"
+	}
+	return errors.New(msg)
+}
+
+// nestedDirectiveOrderFor returns the order used inside nested scopes
+// (route, handle and other subroutes). Outer "order" constraints must not
+// rearrange items within those scopes, so their directives keep the
+// registered baseline positions; directives absent from the baseline
+// (plugins without a registered default position) are appended so they
+// remain usable inside nested scopes without changing local ordering.
+func nestedDirectiveOrderFor(adaptOrder []string) []string {
+	nested := append([]string{}, directiveOrder...)
+	for _, dir := range adaptOrder {
+		if !slices.Contains(nested, dir) {
+			nested = append(nested, dir)
+		}
+	}
+	return nested
 }
 
 // Option gets the option keyed by name.
 func (h Helper) Option(name string) any {
 	return h.options[name]
+}
+
+// effectiveDirectiveOrder returns the directive order carried by this
+// Helper. Site top-level Helpers carry the per-adaptation order merged from
+// the "order" global option; the method itself never resolves or mutates
+// shared state.
+func (h Helper) effectiveDirectiveOrder() []string {
+	if len(h.directiveOrder) > 0 {
+		return h.directiveOrder
+	}
+	return directiveOrder
 }
 
 // Caddyfiles returns the list of config files from
@@ -371,13 +878,28 @@ func (h Helper) WithDispenser(d *caddyfile.Dispenser) Helper {
 // ParseSegmentAsSubroute parses the segment such that its subdirectives
 // are themselves treated as directives, from which a subroute is built
 // and returned.
+//
+// This is the entry point for nested handler scopes (route, handle,
+// handle_errors, and handler modules such as reverse_proxy's
+// handle_response). "order" constraints from the global options block
+// apply only to each site's top-level chain, so nested scopes sort their
+// directives by the registered baseline order, never by the adaptation's
+// reordered one; an outer "order" can therefore never rearrange items
+// within a nested handler.
 func ParseSegmentAsSubroute(h Helper) (caddyhttp.MiddlewareHandler, error) {
+	return parseSegmentAsSubrouteWithOrder(h, nestedDirectiveOrderFor(h.effectiveDirectiveOrder()))
+}
+
+// parseSegmentAsSubrouteWithOrder builds a subroute using the given
+// directive order. Named route blocks, which are top-level handler chains
+// rather than nested handler scopes, reuse the adaptation's order.
+func parseSegmentAsSubrouteWithOrder(h Helper, order []string) (caddyhttp.MiddlewareHandler, error) {
 	allResults, err := parseSegmentAsConfig(h)
 	if err != nil {
 		return nil, err
 	}
 
-	return buildSubroute(allResults, h.groupCounter, true, h.effectiveDirectiveOrder())
+	return buildSubroute(allResults, h.groupCounter, true, order)
 }
 
 // parseSegmentAsConfig parses the segment such that its subdirectives
