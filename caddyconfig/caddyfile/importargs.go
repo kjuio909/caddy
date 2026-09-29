@@ -15,146 +15,186 @@
 package caddyfile
 
 import (
-	"regexp"
+	"fmt"
 	"strconv"
 	"strings"
 
 	"go.uber.org/zap"
-
-	"github.com/caddyserver/caddy/v2"
 )
 
-// parseVariadic determines if the token is a variadic placeholder,
-// and if so, determines the index range (start/end) of args to use.
-// Returns a boolean signaling whether a variadic placeholder was found,
-// and the start and end indices.
-func parseVariadic(token Token, argCount int) (bool, int, int) {
-	if !strings.HasPrefix(token.Text, "{args[") {
-		return false, 0, 0
-	}
-	if !strings.HasSuffix(token.Text, "]}") {
-		return false, 0, 0
-	}
+// argWarnFunc logs a warning while expanding import args.
+type argWarnFunc func(msg string, fields ...zap.Field)
 
-	argRange := strings.TrimSuffix(strings.TrimPrefix(token.Text, "{args["), "]}")
-	if argRange == "" {
-		caddy.Log().Named("caddyfile").Warn(
-			"Placeholder "+token.Text+" cannot have an empty index",
-			zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-		return false, 0, 0
-	}
-
-	start, end, found := strings.Cut(argRange, ":")
-
-	// If no ":" delimiter is found, this is not a variadic.
-	// The replacer will pick this up.
-	if !found {
-		return false, 0, 0
+// expandArgsToken substitutes every complete {args...} placeholder
+// in token using the positional args of one import statement.
+//
+// Only complete placeholders are substituted: ordinary braces
+// (e.g. {host} or {env.FOO}) and escaped braces (\{ \}) are kept
+// verbatim, along with any literal text adjacent to a placeholder.
+// Substituted values never pass through expansion again, even if
+// they contain braces. A normal substitution always yields exactly
+// one token, so values containing spaces, quotes, or nothing at all
+// preserve the token's original boundaries. A variadic placeholder
+// ({args[start:end]}) must occupy a token on its own and expands to
+// one token per referenced argument, in declaration order.
+//
+// Malformed placeholders, negative, empty, or out-of-range indices,
+// and references despite no declared args are reported as errors
+// instead of being silently left in place.
+func expandArgsToken(token Token, args []string, warn argWarnFunc) ([]string, error) {
+	if warn == nil {
+		warn = func(string, ...zap.Field) {}
 	}
 
-	// A valid token may contain several placeholders, and
-	// they may be separated by ":". It's not variadic.
-	// https://github.com/caddyserver/caddy/issues/5716
-	if strings.Contains(start, "}") || strings.Contains(end, "{") {
-		return false, 0, 0
-	}
+	text := token.Text
+	var sb strings.Builder
+	sb.Grow(len(text))
 
-	var (
-		startIndex = 0
-		endIndex   = argCount
-		err        error
-	)
-	if start != "" {
-		startIndex, err = strconv.Atoi(start)
-		if err != nil {
-			caddy.Log().Named("caddyfile").Warn(
-				"Variadic placeholder "+token.Text+" has an invalid start index",
-				zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-			return false, 0, 0
+	// a variadic placeholder occupies the whole token, so when one
+	// is found its expansion replaces the token entirely
+	var variadicValues []string
+
+	for i := 0; i < len(text); {
+		// escaped braces are literal braces, never placeholders
+		if text[i] == '\\' && i+1 < len(text) && (text[i+1] == '{' || text[i+1] == '}') {
+			sb.WriteByte(text[i+1])
+			i += 2
+			continue
 		}
-	}
-	if end != "" {
-		endIndex, err = strconv.Atoi(end)
-		if err != nil {
-			caddy.Log().Named("caddyfile").Warn(
-				"Variadic placeholder "+token.Text+" has an invalid end index",
-				zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-			return false, 0, 0
+
+		if text[i] != '{' {
+			sb.WriteByte(text[i])
+			i++
+			continue
 		}
+
+		closeIdx := findUnescapedCloseBrace(text, i)
+		if closeIdx < 0 {
+			// no closing brace: this is not a complete placeholder,
+			// so the rest of the token is preserved verbatim
+			sb.WriteString(text[i:])
+			break
+		}
+
+		key := text[i+1 : closeIdx]
+		group := text[i : closeIdx+1]
+		sole := i == 0 && closeIdx == len(text)-1
+
+		switch {
+		case strings.HasPrefix(key, argsBracketPrefix) && strings.HasSuffix(key, "]"):
+			indexSpec := key[len(argsBracketPrefix) : len(key)-1]
+			if strings.Count(indexSpec, ":") == 1 {
+				start, end, err := parseVariadicIndices(group, indexSpec, len(args))
+				if err != nil {
+					return nil, err
+				}
+				if !sole {
+					return nil, fmt.Errorf("variadic placeholder %s must be a token on its own", group)
+				}
+				values := make([]string, end-start)
+				copy(values, args[start:end])
+				variadicValues = values
+			} else {
+				index, err := parseArgIndex(group, indexSpec, len(args))
+				if err != nil {
+					return nil, err
+				}
+				sb.WriteString(args[index])
+			}
+
+		case strings.HasPrefix(key, argsDeprecatedPrefix):
+			indexSpec := key[len(argsDeprecatedPrefix):]
+			index, err := parseArgIndex(group, indexSpec, len(args))
+			if err != nil {
+				return nil, err
+			}
+			warn("Placeholder "+group+" deprecated, use {args["+indexSpec+"]} instead",
+				zap.String("file", token.File+":"+strconv.Itoa(token.Line)),
+				zap.Strings("import_chain", token.imports))
+			sb.WriteString(args[index])
+
+		default:
+			// ordinary braces ({host}, {block}, {env.FOO}, ...)
+			// stay; write just the opening brace and keep scanning so
+			// that placeholders nested inside other braces (as in
+			// JSON tokens) are still expanded
+			sb.WriteByte('{')
+			i++
+			continue
+		}
+
+		i = closeIdx + 1
 	}
 
-	// bound check
-	if startIndex < 0 || startIndex > endIndex || endIndex > argCount {
-		caddy.Log().Named("caddyfile").Warn(
-			"Variadic placeholder "+token.Text+" indices are out of bounds, only "+strconv.Itoa(argCount)+" argument(s) exist",
-			zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-		return false, 0, 0
+	if variadicValues != nil {
+		return variadicValues, nil
 	}
-	return true, startIndex, endIndex
+	return []string{sb.String()}, nil
 }
 
-// makeArgsReplacer prepares a Replacer which can replace
-// non-variadic args placeholders in imported tokens.
-func makeArgsReplacer(args []string) *caddy.Replacer {
-	repl := caddy.NewEmptyReplacer()
-	repl.Map(func(key string) (any, bool) {
-		// TODO: Remove the deprecated {args.*} placeholder
-		// support at some point in the future
-		if matches := argsRegexpIndexDeprecated.FindStringSubmatch(key); len(matches) > 0 {
-			// What's matched may be a substring of the key
-			if matches[0] != key {
-				return nil, false
-			}
-
-			value, err := strconv.Atoi(matches[1])
-			if err != nil {
-				caddy.Log().Named("caddyfile").Warn(
-					"Placeholder {args." + matches[1] + "} has an invalid index")
-				return nil, false
-			}
-			if value >= len(args) {
-				caddy.Log().Named("caddyfile").Warn(
-					"Placeholder {args." + matches[1] + "} index is out of bounds, only " + strconv.Itoa(len(args)) + " argument(s) exist")
-				return nil, false
-			}
-			caddy.Log().Named("caddyfile").Warn(
-				"Placeholder {args." + matches[1] + "} deprecated, use {args[" + matches[1] + "]} instead")
-			return args[value], true
+// findUnescapedCloseBrace returns the index of the first } at or
+// after open that is not preceded by a backslash, or -1.
+func findUnescapedCloseBrace(text string, open int) int {
+	for i := open + 1; i < len(text); i++ {
+		if text[i] == '}' && (i == open+1 || text[i-1] != '\\') {
+			return i
 		}
-
-		// Handle args[*] form
-		if matches := argsRegexpIndex.FindStringSubmatch(key); len(matches) > 0 {
-			// What's matched may be a substring of the key
-			if matches[0] != key {
-				return nil, false
-			}
-
-			if strings.Contains(matches[1], ":") {
-				caddy.Log().Named("caddyfile").Warn(
-					"Variadic placeholder {args[" + matches[1] + "]} must be a token on its own")
-				return nil, false
-			}
-			value, err := strconv.Atoi(matches[1])
-			if err != nil {
-				caddy.Log().Named("caddyfile").Warn(
-					"Placeholder {args[" + matches[1] + "]} has an invalid index")
-				return nil, false
-			}
-			if value >= len(args) {
-				caddy.Log().Named("caddyfile").Warn(
-					"Placeholder {args[" + matches[1] + "]} index is out of bounds, only " + strconv.Itoa(len(args)) + " argument(s) exist")
-				return nil, false
-			}
-			return args[value], true
-		}
-
-		// Not an args placeholder, ignore
-		return nil, false
-	})
-	return repl
+	}
+	return -1
 }
 
-var (
-	argsRegexpIndexDeprecated = regexp.MustCompile(`args\.(.+)`)
-	argsRegexpIndex           = regexp.MustCompile(`args\[(.+)]`)
+// parseArgIndex parses a non-negative index and bounds it against
+// the number of declared args.
+func parseArgIndex(group, indexSpec string, argCount int) (int, error) {
+	if indexSpec == "" {
+		return 0, fmt.Errorf("placeholder %s cannot have an empty index", group)
+	}
+	if strings.Contains(indexSpec, ":") {
+		return 0, fmt.Errorf("variadic placeholder %s must be a token on its own", group)
+	}
+	index, err := strconv.Atoi(indexSpec)
+	if err != nil || index < 0 {
+		return 0, fmt.Errorf("placeholder %s has an invalid index", group)
+	}
+	if index >= argCount {
+		return 0, fmt.Errorf("placeholder %s index is out of bounds, only %d argument(s) exist",
+			group, argCount)
+	}
+	return index, nil
+}
+
+// parseVariadicIndices resolves the start/end of a {args[s:e]}
+// reference against the number of declared args.
+func parseVariadicIndices(group, indexSpec string, argCount int) (int, int, error) {
+	startSpec, endSpec, _ := strings.Cut(indexSpec, ":")
+	if strings.Contains(endSpec, ":") {
+		return 0, 0, fmt.Errorf("variadic placeholder %s has an invalid index range", group)
+	}
+
+	startIndex := 0
+	endIndex := argCount
+	var err error
+	if startSpec != "" {
+		startIndex, err = strconv.Atoi(startSpec)
+		if err != nil {
+			return 0, 0, fmt.Errorf("variadic placeholder %s has an invalid start index", group)
+		}
+	}
+	if endSpec != "" {
+		endIndex, err = strconv.Atoi(endSpec)
+		if err != nil {
+			return 0, 0, fmt.Errorf("variadic placeholder %s has an invalid end index", group)
+		}
+	}
+	if startIndex < 0 || endIndex < 0 || startIndex > endIndex ||
+		startIndex > argCount || endIndex > argCount {
+		return 0, 0, fmt.Errorf("variadic placeholder %s indices are out of bounds, only %d argument(s) exist",
+			group, argCount)
+	}
+	return startIndex, endIndex, nil
+}
+
+const (
+	argsBracketPrefix    = "args["
+	argsDeprecatedPrefix = "args."
 )

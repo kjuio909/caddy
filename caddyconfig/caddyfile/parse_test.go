@@ -22,88 +22,94 @@ import (
 	"testing"
 )
 
-func TestParseVariadic(t *testing.T) {
-	args := make([]string, 10)
+func TestExpandArgsToken(t *testing.T) {
 	for i, tc := range []struct {
-		input  string
-		result bool
+		input string
+		args  []string
+		want  []string
+		err   bool
 	}{
-		{
-			input:  "",
-			result: false,
-		},
-		{
-			input:  "{args[1",
-			result: false,
-		},
-		{
-			input:  "1]}",
-			result: false,
-		},
-		{
-			input:  "{args[:]}aaaaa",
-			result: false,
-		},
-		{
-			input:  "aaaaa{args[:]}",
-			result: false,
-		},
-		{
-			input:  "{args.}",
-			result: false,
-		},
-		{
-			input:  "{args.1}",
-			result: false,
-		},
-		{
-			input:  "{args[]}",
-			result: false,
-		},
-		{
-			input:  "{args[:]}",
-			result: true,
-		},
-		{
-			input:  "{args[:]}",
-			result: true,
-		},
-		{
-			input:  "{args[0:]}",
-			result: true,
-		},
-		{
-			input:  "{args[:0]}",
-			result: true,
-		},
-		{
-			input:  "{args[-1:]}",
-			result: false,
-		},
-		{
-			input:  "{args[:11]}",
-			result: false,
-		},
-		{
-			input:  "{args[10:0]}",
-			result: false,
-		},
-		{
-			input:  "{args[0:10]}",
-			result: true,
-		},
-		{
-			input:  "{args[0]}:{args[1]}:{args[2]}",
-			result: false,
-		},
+		// ordinary text and braces are untouched
+		{input: "", args: []string{"a"}, want: []string{""}},
+		{input: "plain", args: []string{"a"}, want: []string{"plain"}},
+		{input: "{host}", args: []string{"a"}, want: []string{"{host}"}},
+		{input: "{env.FOO}", args: []string{"a"}, want: []string{"{env.FOO}"}},
+		{input: "{block}", args: []string{"a"}, want: []string{"{block}"}},
+		{input: "{args[0]", args: []string{"a"}, want: []string{"{args[0]"}},
+
+		// complete placeholders, including adjacent text
+		{input: "{args[0]}", args: []string{"a"}, want: []string{"a"}},
+		{input: "x{args[0]}y", args: []string{"a"}, want: []string{"xay"}},
+		{input: `{"key":"{args[0]}"}`, args: []string{"123"}, want: []string{`{"key":"123"}`}},
+		{input: `{"key":[{args[0]},{args[1]}]}`, args: []string{"123", "456"}, want: []string{`{"key":[123,456]}`}},
+
+		// several placeholders in one token stay one token
+		{input: "{args[0]}:{args[1]}", args: []string{"a", "b"}, want: []string{"a:b"}},
+
+		// escaped braces are literal braces
+		{input: `\{args[0]\}`, args: []string{"a"}, want: []string{"{args[0]}"}},
+		{input: `\{{args[0]}\}`, args: []string{"a"}, want: []string{"{a}"}},
+
+		// values with spaces, quotes, or emptiness keep one-token boundaries
+		{input: "{args[0]}", args: []string{"the confused man"}, want: []string{"the confused man"}},
+		{input: "{args[0]}", args: []string{`"quoted"`}, want: []string{`"quoted"`}},
+		{input: "before {args[0]} after", args: []string{""}, want: []string{"before  after"}},
+
+		// braces inside substituted values are never expanded again
+		{input: "{args[0]}", args: []string{"{host}"}, want: []string{"{host}"}},
+		{input: "{args[0]}", args: []string{"{args[1]}"}, want: []string{"{args[1]}"}},
+
+		// variadic placeholders expand in declaration order, one token per arg
+		{input: "{args[:]}", args: []string{"a", "b", "c"}, want: []string{"a", "b", "c"}},
+		{input: "{args[0:]}", args: []string{"a", "b", "c"}, want: []string{"a", "b", "c"}},
+		{input: "{args[:0]}", args: []string{"a", "b", "c"}, want: []string{}},
+		{input: "{args[1:3]}", args: []string{"a", "b", "c"}, want: []string{"b", "c"}},
+		{input: "{args[1:1]}", args: []string{"a", "b", "c"}, want: []string{}},
+		{input: "{args[:]}", args: nil, want: []string{}},
+
+		// undeclared, negative, empty, and out-of-range placeholders are errors
+		{input: "{args[5]}", args: []string{"a"}, err: true},
+		{input: "{args[]}", args: []string{"a"}, err: true},
+		{input: "{args[-1]}", args: []string{"a"}, err: true},
+		{input: "{args[0]}", args: nil, err: true},
+		{input: "{args[0]}", args: []string{}, err: true},
+		{input: "x{args[9]}", args: []string{"a"}, err: true},
+		{input: "{args[abc]}", args: []string{"a"}, err: true},
+		{input: "{args[-1:]}", args: []string{"a", "b"}, err: true},
+		{input: "{args[:11]}", args: []string{"a", "b"}, err: true},
+		{input: "{args[10:0]}", args: []string{"a"}, err: true},
+		{input: "{args[1::2]}", args: []string{"a"}, err: true},
+
+		// variadic placeholders must be a token on their own
+		{input: "{args[:]}aaaaa", args: []string{"a"}, err: true},
+		{input: "aaaaa{args[:]}", args: []string{"a"}, err: true},
+		{input: "{args[0]}:{args[1:]}", args: []string{"a", "b"}, err: true},
+
+		// unclosed braces are never complete placeholders
+		{input: "{args[0]", args: []string{"a"}, want: []string{"{args[0]"}},
+		{input: "{args[", args: []string{"a"}, want: []string{"{args["}},
 	} {
-		token := Token{
-			File: "test",
-			Line: 1,
-			Text: tc.input,
+		token := Token{File: "test", Line: 1, Text: tc.input}
+		got, err := expandArgsToken(token, tc.args, nil)
+		if tc.err {
+			if err == nil {
+				t.Errorf("case %d (%q): expected error, got %v", i, tc.input, got)
+			}
+			continue
 		}
-		if v, _, _ := parseVariadic(token, len(args)); v != tc.result {
-			t.Errorf("Test %d error expectation failed Expected: %t, got %t", i, tc.result, v)
+		if err != nil {
+			t.Errorf("case %d (%q): unexpected error: %v", i, tc.input, err)
+			continue
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("case %d (%q): expected %d tokens %v, got %d tokens %v",
+				i, tc.input, len(tc.want), tc.want, len(got), got)
+			continue
+		}
+		for j := range got {
+			if got[j] != tc.want[j] {
+				t.Errorf("case %d token %d: expected %q, got %q", i, j, tc.want[j], got[j])
+			}
 		}
 	}
 }
@@ -751,10 +757,18 @@ func TestImportReplacementInJSONWithBrace(t *testing.T) {
 			expect: `{"key":[123,123]}`,
 		},
 	} {
-		repl := makeArgsReplacer(test.args)
-		actual := repl.ReplaceKnown(test.input, "")
-		if actual != test.expect {
-			t.Errorf("Test %d: Expected: '%s' but got '%s'", i, test.expect, actual)
+		token := Token{File: "test", Line: 1, Text: test.input}
+		got, err := expandArgsToken(token, test.args, nil)
+		if err != nil {
+			t.Errorf("Test %d: unexpected error: %v", i, err)
+			continue
+		}
+		if len(got) != 1 {
+			t.Errorf("Test %d: expected exactly one token, got %v", i, got)
+			continue
+		}
+		if got[0] != test.expect {
+			t.Errorf("Test %d: Expected: '%s' but got '%s'", i, test.expect, got[0])
 		}
 	}
 }

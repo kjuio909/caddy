@@ -17,6 +17,7 @@ package caddyfile
 import (
 	"fmt"
 	"slices"
+	"strings"
 )
 
 type adjacency map[string][]string
@@ -57,13 +58,18 @@ func (i *importGraph) addEdge(from, to string) error {
 		return fmt.Errorf("one of the nodes does not exist")
 	}
 
-	if i.willCycle(to, from) {
-		return fmt.Errorf("a cycle of imports exists between %s and %s", from, to)
-	}
-
 	if i.areConnected(from, to) {
 		// if connected, there's nothing to do
 		return nil
+	}
+
+	// adding the edge from -> to closes a cycle if `to` can
+	// already reach `from` (including the self-edge case);
+	// findPath returns the readable chain to -> ... -> from
+	if path := i.findPath(to, from); path != nil {
+		cycle := append(path, to)
+		return fmt.Errorf("a cycle of imports exists between %s and %s: %s",
+			from, to, strings.Join(cycle, " -> "))
 	}
 
 	if i.nodes == nil {
@@ -95,29 +101,31 @@ func (i *importGraph) areConnected(from, to string) bool {
 	return slices.Contains(al, to)
 }
 
-func (i *importGraph) willCycle(from, to string) bool {
-	collector := make(map[string]bool)
-
-	var visit func(string)
-	visit = func(start string) {
-		if !collector[start] {
-			collector[start] = true
-			for _, v := range i.edges[start] {
-				visit(v)
+// findPath returns a path of node names from start to target
+// following existing edges, or nil if no such path exists.
+// Edges leave nodes in insertion order, so the reported cycle
+// is stable for identical inputs.
+func (i *importGraph) findPath(start, target string) []string {
+	if start == target {
+		return []string{start}
+	}
+	visited := map[string]bool{start: true}
+	queue := [][]string{{start}}
+	for len(queue) > 0 {
+		path := queue[0]
+		queue = queue[1:]
+		current := path[len(path)-1]
+		for _, next := range i.edges[current] {
+			if next == target {
+				return append(path, next)
+			}
+			if !visited[next] {
+				visited[next] = true
+				queue = append(queue, append(append([]string{}, path...), next))
 			}
 		}
 	}
-
-	for _, v := range i.edges[from] {
-		visit(v)
-	}
-	for k := range collector {
-		if to == k {
-			return true
-		}
-	}
-
-	return false
+	return nil
 }
 
 func (i *importGraph) exists(key string) bool {

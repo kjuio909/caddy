@@ -123,6 +123,9 @@ func (l *lexer) next() (bool, error) {
 		// If no EOF, then we had a problem.
 		ch, _, err := l.reader.ReadRune()
 		if err != nil {
+			if quoted || btQuoted {
+				return false, fmt.Errorf("malformed quoted value on line #%d: missing closing quote", l.line)
+			}
 			if len(val) > 0 {
 				if inHeredoc {
 					return false, fmt.Errorf("incomplete heredoc <<%s on line #%d, expected ending marker %s", heredocMarker, l.line+l.skippedLines, heredocMarker)

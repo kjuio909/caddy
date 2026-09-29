@@ -16,10 +16,12 @@ package caddyfile
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"go.uber.org/zap"
@@ -36,7 +38,34 @@ import (
 //
 // Environment variables in {$ENVIRONMENT_VARIABLE} notation
 // will be replaced before parsing begins.
-func Parse(filename string, input []byte) ([]ServerBlock, error) {
+//
+// The contents of the top-level file and every file it imports
+// are fixed for the duration of the call through one snapshot:
+// the optional ImportReader (see WithImportReader) is read at
+// most once per path, and each read is copied. Replacing the
+// reader's data during the parse, serving a different version on
+// repeat reads, or triggering concurrent reads cannot mix other
+// versions into the result, and mutating the reader after Parse
+// returns cannot change the returned tokens. Without an
+// ImportReader, imports are read from the operating system
+// filesystem as before.
+//
+// A failed parse returns nil server blocks: no partially
+// expanded directives survive an error.
+func Parse(filename string, input []byte, opts ...ParseOption) ([]ServerBlock, error) {
+	options := &parseOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+	if options.importReader == nil {
+		options.importReader = osImportReader{}
+	}
+	// readers that can snapshot themselves are frozen once, before
+	// any byte is read; every call thus starts from one fixed tree
+	if snapshoter, ok := options.importReader.(interface{ Snapshot() ImportReader }); ok {
+		options.importReader = snapshoter.Snapshot()
+	}
+
 	// unfortunately, we must copy the input because parsing must
 	// remain a read-only operation, but we have to expand environment
 	// variables before we parse, which changes the underlying array (#4422)
@@ -53,8 +82,38 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 			nodes: make(map[string]struct{}),
 			edges: make(adjacency),
 		},
+		snapshot: newImportSnapshot(options.importReader),
 	}
-	return p.parseAll()
+
+	blocks, err := p.parseAll()
+	if err != nil {
+		// never hand back a half-expanded configuration
+		return nil, err
+	}
+
+	// warnings are observable only after the whole parse succeeded
+	for _, w := range p.warnings {
+		w.emit()
+	}
+
+	return blocks, nil
+}
+
+// deferredWarning is a warning held until a parse completes
+// successfully, so a failed parse never surfaces warnings
+// alongside its error.
+type deferredWarning struct {
+	named  bool // emit through the "caddyfile" named logger
+	msg    string
+	fields []zap.Field
+}
+
+func (w deferredWarning) emit() {
+	if w.named {
+		caddy.Log().Named("caddyfile").Warn(w.msg, w.fields...)
+		return
+	}
+	caddy.Log().Warn(w.msg, w.fields...)
 }
 
 // allTokens lexes the entire input, but does not parse it.
@@ -117,6 +176,8 @@ type parser struct {
 	definedSnippets map[string][]Token
 	nesting         int
 	importGraph     importGraph
+	snapshot        *importSnapshot
+	warnings        []deferredWarning
 }
 
 func (p *parser) parseAll() ([]ServerBlock, error) {
@@ -125,13 +186,13 @@ func (p *parser) parseAll() ([]ServerBlock, error) {
 	for p.Next() {
 		err := p.parseOne()
 		if err != nil {
-			return blocks, err
+			return nil, err
 		}
 		if len(p.block.Keys) > 0 || len(p.block.Segments) > 0 {
 			blocks = append(blocks, p.block)
 		}
 		if p.nesting > 0 {
-			return blocks, p.EOFErr()
+			return nil, p.EOFErr()
 		}
 	}
 
@@ -348,12 +409,22 @@ func (p *parser) directives() error {
 }
 
 // doImport swaps out the import directive and its argument
-// (a total of 2 tokens) with the tokens in the specified file
-// or globbing pattern. When the function returns, the cursor
-// is on the token before where the import directive was. In
-// other words, call Next() to access the first token that was
+// (a total of 2 tokens) with the tokens in the specified file,
+// snippet, or globbing pattern. When the function returns, the
+// cursor is on the token before where the import directive was;
+// in other words, call Next() to access the first token that was
 // imported.
 func (p *parser) doImport(nesting int) error {
+	// remember where the import directive itself starts, so errors
+	// always point at the import statement rather than whatever the
+	// reader's error happens to carry
+	importToken := p.Token()
+
+	// parsers built without Parse (e.g. tests) default to the OS reader
+	if p.snapshot == nil {
+		p.snapshot = newImportSnapshot(osImportReader{})
+	}
+
 	// syntax checks
 	if !p.NextArg() {
 		return p.ArgErr()
@@ -363,11 +434,9 @@ func (p *parser) doImport(nesting int) error {
 		return p.Err("Import requires a non-empty filepath")
 	}
 
-	// grab remaining args as placeholder replacements
+	// grab remaining args as placeholder replacements; positional
+	// args are visible only within this import expansion
 	args := p.RemainingArgs()
-
-	// set up a replacer for non-variadic args replacement
-	repl := makeArgsReplacer(args)
 
 	// grab all the tokens (if it exists) from within a block that follows the import
 	var blockTokens []Token
@@ -416,54 +485,72 @@ func (p *parser) doImport(nesting int) error {
 		}
 	} else {
 		// make path relative to the file of the _token_ being processed rather
-		// than current working directory (issue #867) and then use glob to get
-		// list of matching filenames
-		absFile, err := caddy.FastAbs(p.Dispenser.File())
+		// than current working directory (issue #867), clean dot segments,
+		// and then use glob to get the list of matching filenames
+		globPattern, err := resolveImportPattern(p.Dispenser.File(), importPattern)
 		if err != nil {
-			return p.Errf("Failed to get absolute path of file: %s: %v", p.Dispenser.File(), err)
+			return p.wrapImportError(importToken,
+				fmt.Errorf("failed to get absolute path of file: %s: %v", p.Dispenser.File(), err))
 		}
-
+		isGlob := strings.ContainsAny(globPattern, "*?[]")
 		var matches []string
-		var globPattern string
-		if !filepath.IsAbs(importPattern) {
-			globPattern = filepath.Join(filepath.Dir(absFile), importPattern)
-		} else {
-			globPattern = importPattern
-		}
-		if strings.Count(globPattern, "*") > 1 || strings.Count(globPattern, "?") > 1 ||
-			(strings.Contains(globPattern, "[") && strings.Contains(globPattern, "]")) {
-			// See issue #2096 - a pattern with many glob expansions can hang for too long
-			return p.Errf("Glob pattern may only contain one wildcard (*), but has others: %s", globPattern)
-		}
-		matches, err = filepath.Glob(globPattern)
-		if err != nil {
-			return p.Errf("Failed to use import pattern %s: %v", importPattern, err)
-		}
-		if len(matches) == 0 {
-			if strings.ContainsAny(globPattern, "*?[]") {
-				caddy.Log().Warn("No files matching import glob pattern", zap.String("pattern", importPattern))
-			} else {
-				return p.Errf("File to import not found: %s", importPattern)
+		if isGlob {
+			if strings.Count(globPattern, "*") > 1 || strings.Count(globPattern, "?") > 1 ||
+				(strings.Contains(globPattern, "[") && strings.Contains(globPattern, "]")) {
+				// See issue #2096 - a pattern with many glob expansions can hang for too long
+				return p.wrapImportError(importToken,
+					fmt.Errorf("glob pattern may only contain one wildcard (*), but has others: %s", globPattern))
 			}
-		} else {
-			// See issue #5295 - should skip any files that start with a . when iterating over them.
-			sep := string(filepath.Separator)
-			segGlobPattern := strings.Split(globPattern, sep)
-			if strings.HasPrefix(segGlobPattern[len(segGlobPattern)-1], "*") {
-				var tmpMatches []string
+			matches, err = p.snapshot.glob(globPattern)
+			if err != nil {
+				return p.wrapImportError(importToken,
+					fmt.Errorf("failed to use import pattern %s: %v", globPattern, err))
+			}
+
+			// See issue #5295 - a wildcard in the last segment skips
+			// files whose base name starts with a dot
+			if strings.HasPrefix(filepath.Base(globPattern), "*") {
+				filtered := matches[:0]
 				for _, m := range matches {
-					seg := strings.Split(m, sep)
-					if !strings.HasPrefix(seg[len(seg)-1], ".") {
-						tmpMatches = append(tmpMatches, m)
+					if !strings.HasPrefix(filepath.Base(m), ".") {
+						filtered = append(filtered, m)
 					}
 				}
-				matches = tmpMatches
+				matches = filtered
 			}
+			// fix the whole surviving set before splicing, so all
+			// imported files come from the same snapshot
+			if err := p.snapshot.pin(matches); err != nil {
+				return p.wrapImportError(importToken,
+					fmt.Errorf("could not import files matching %s: %v", globPattern, err))
+			}
+			// a glob with no matches keeps the historical success
+			// semantics; hold the warning until the parse succeeds
+			if len(matches) == 0 {
+				p.warnings = append(p.warnings, deferredWarning{
+					msg:    "No files matching import glob pattern",
+					fields: []zap.Field{zap.String("pattern", importPattern)},
+				})
+			}
+		} else {
+			// a direct import is pinned with Stat+ReadFile, so
+			// unreadable targets and read errors fail the parse
+			_, err := p.snapshot.ensure(globPattern)
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					return p.wrapImportError(importToken,
+						fmt.Errorf("file to import not found: %s", globPattern))
+				}
+				return p.wrapImportError(importToken,
+					fmt.Errorf("could not import %s: %v", globPattern, err))
+			}
+			matches = []string{globPattern}
 		}
 
-		// collect all the imported tokens
+		// collect all the imported tokens; matches were pinned by
+		// the resolution above, so every file comes from one snapshot
 		for _, importFile := range matches {
-			newTokens, err := p.doSingleImport(importFile)
+			newTokens, err := p.doSingleImport(importToken, importFile)
 			if err != nil {
 				return err
 			}
@@ -480,7 +567,7 @@ func (p *parser) doImport(nesting int) error {
 	p.importGraph.addNodes(nodes)
 	if err := p.importGraph.addEdges(nodeName, nodes); err != nil {
 		p.importGraph.removeNodes(nodes)
-		return err
+		return p.wrapImportError(importToken, err)
 	}
 
 	// copy the tokens so we don't overwrite p.definedSnippets
@@ -492,16 +579,24 @@ func (p *parser) doImport(nesting int) error {
 		index          int
 	)
 
-	// run the argument replacer on the tokens
-	// golang for range slice return a copy of value
-	// similarly, append also copy value
+	// positional args warnings are held like every other warning
+	warn := func(msg string, fields ...zap.Field) {
+		p.warnings = append(p.warnings, deferredWarning{named: true, msg: msg, fields: fields})
+	}
+
+	// run the argument expansion on the tokens; range copies the
+	// token value, and append copies it as well
 	for i, token := range importedTokens {
-		// update the token's imports to refer to import directive filename, line number and snippet name if there is one
+		// update the token's imports to refer to import directive filename, line number and snippet name if there is one;
+		// imported tokens may be shared (snippets, repeated imports), so copy the
+		// chain instead of growing a slice another expansion happens to share
+		var chain string
 		if token.snippetName != "" {
-			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import %s)", p.File(), p.Line(), token.snippetName))
+			chain = fmt.Sprintf("%s:%d (import %s)", p.File(), p.Line(), token.snippetName)
 		} else {
-			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import)", p.File(), p.Line()))
+			chain = fmt.Sprintf("%s:%d (import)", p.File(), p.Line())
 		}
+		token.imports = append(slices.Clone(token.imports), chain)
 
 		// naive way of determine snippets, as snippets definition can only follow name + block
 		// format, won't check for nesting correctness or any other error, that's what parser does.
@@ -563,15 +658,17 @@ func (p *parser) doImport(nesting int) error {
 			continue
 		}
 
-		foundVariadic, startIndex, endIndex := parseVariadic(token, len(args))
-		if foundVariadic {
-			for _, arg := range args[startIndex:endIndex] {
-				token.Text = arg
-				tokensCopy = append(tokensCopy, token)
-			}
-		} else {
-			token.Text = repl.ReplaceKnown(token.Text, "")
-			tokensCopy = append(tokensCopy, token)
+		// expand {args...} placeholders; ordinary braces and
+		// escaped braces are left untouched, and substituted text
+		// is never expanded again
+		texts, err := expandArgsToken(token, args, warn)
+		if err != nil {
+			return p.wrapImportError(importToken, err)
+		}
+		for _, text := range texts {
+			expanded := token
+			expanded.Text = text
+			tokensCopy = append(tokensCopy, expanded)
 		}
 	}
 
@@ -583,42 +680,55 @@ func (p *parser) doImport(nesting int) error {
 	return nil
 }
 
-// doSingleImport lexes the individual file at importFile and returns
-// its tokens or an error, if any.
-func (p *parser) doSingleImport(importFile string) ([]Token, error) {
-	file, err := os.Open(importFile)
+// wrapImportError reports err at the import statement that caused
+// it instead of the token the cursor happens to be on, which may be
+// deep inside an imported file. This makes the first failing
+// location stable across runs.
+func (p *parser) wrapImportError(importToken Token, err error) error {
+	if len(importToken.imports) > 0 {
+		return fmt.Errorf("%w, at %s:%d import chain ['%s']", err,
+			importToken.File, importToken.Line, strings.Join(importToken.imports, "','"))
+	}
+	return fmt.Errorf("%w, at %s:%d", err, importToken.File, importToken.Line)
+}
+
+// doSingleImport lexes the individual file at importFile from the
+// parse snapshot and returns its tokens, or an error.
+func (p *parser) doSingleImport(importToken Token, importFile string) ([]Token, error) {
+	cached, err := p.snapshot.ensure(importFile)
 	if err != nil {
-		return nil, p.Errf("Could not import %s: %v", importFile, err)
+		return nil, p.wrapImportError(importToken,
+			fmt.Errorf("could not import %s: %v", importFile, err))
 	}
-	defer file.Close()
-
-	if info, err := file.Stat(); err != nil {
-		return nil, p.Errf("Could not import %s: %v", importFile, err)
-	} else if info.IsDir() {
-		return nil, p.Errf("Could not import %s: is a directory", importFile)
+	if cached.info.IsDir() {
+		return nil, p.wrapImportError(importToken,
+			fmt.Errorf("could not import %s: is a directory", importFile))
 	}
 
-	input, err := io.ReadAll(file)
-	if err != nil {
-		return nil, p.Errf("Could not read imported file %s: %v", importFile, err)
-	}
+	input := cached.data
 
-	// only warning in case of empty files
+	// only warning in case of empty files; hold it until success
 	if len(input) == 0 || len(strings.TrimSpace(string(input))) == 0 {
-		caddy.Log().Warn("Import file is empty", zap.String("file", importFile))
+		p.warnings = append(p.warnings, deferredWarning{
+			msg:    "Import file is empty",
+			fields: []zap.Field{zap.String("file", importFile)},
+		})
 		return []Token{}, nil
 	}
 
-	importedTokens, err := allTokens(importFile, input)
+	importedTokens, err := allTokens(importFile, append([]byte(nil), input...))
 	if err != nil {
-		return nil, p.Errf("Could not read tokens while importing %s: %v", importFile, err)
+		return nil, p.wrapImportError(importToken,
+			fmt.Errorf("could not read tokens while importing %s: %v", importFile, err))
 	}
 
-	// Tack the file path onto these tokens so errors show the imported file's name
-	// (we use full, absolute path to avoid bugs: issue #1892)
+	// Tack the file path onto these tokens so errors show the imported file's name.
+	// Matched files are already absolute after glob resolution, but a direct
+	// import may not be; normalize either way (#1892).
 	filename, err := caddy.FastAbs(importFile)
 	if err != nil {
-		return nil, p.Errf("Failed to get absolute path of file: %s: %v", importFile, err)
+		return nil, p.wrapImportError(importToken,
+			fmt.Errorf("failed to get absolute path of file: %s: %v", importFile, err))
 	}
 	for i := range importedTokens {
 		importedTokens[i].File = filename
