@@ -79,7 +79,10 @@ func (st ServerType) Setup(
 		})
 	}
 
-	// apply any global options
+	// apply any global options. "order" constraints are accumulated purely
+	// from this adaptation's global options block, so start from a clean
+	// slate even when the caller reused the same options map across calls.
+	delete(options, "order")
 	var err error
 	originalServerBlocks, err = st.evaluateGlobalOptionsBlock(originalServerBlocks, options)
 	if err != nil {
@@ -87,11 +90,18 @@ func (st ServerType) Setup(
 	}
 
 	// Resolve the directive order for this adaptation. The "order" global
-	// option stores a per-adaptation order in options; we read it here once
-	// and thread it through every Helper and subroute build below. This keeps
-	// the ordering local to the call even when one Adapter is shared by
-	// concurrent adaptations.
-	adaptDirectiveOrder := directiveOrderForOptions(options)
+	// option accumulates per-adaptation ordering constraints in options; we
+	// merge them with the baseline once here and thread the result through
+	// every Helper and site-level subroute build below. Nested scopes
+	// (route, handle and their children) keep their local order and never
+	// receive this order. This keeps the ordering local to the call even
+	// when one Adapter is shared by concurrent adaptations, and an
+	// unsatisfiable constraint (a cycle) fails the whole adaptation here,
+	// before any JSON is produced.
+	adaptDirectiveOrder, err := resolveAdaptationDirectiveOrder(options)
+	if err != nil {
+		return nil, warnings, err
+	}
 
 	// this will replace both static and user-defined placeholder shorthands
 	// with actual identifiers used by Caddy
@@ -880,7 +890,7 @@ func (st *ServerType) serversFromPairings(
 
 			// set up each handler directive, making sure to honor directive order
 			dirRoutes := sblock.pile["route"]
-			siteSubroute, err := buildSubroute(dirRoutes, groupCounter, true, order)
+			siteSubroute, err := buildSubroute(dirRoutes, groupCounter, sortByDirectiveOrder, true, order)
 			if err != nil {
 				return nil, err
 			}
@@ -1296,18 +1306,44 @@ func appendSubrouteToRouteList(routeList caddyhttp.RouteList,
 	return routeList
 }
 
+// subrouteSortMode selects how a subroute's routes are arranged.
+type subrouteSortMode int
+
+const (
+	// sortByDirectiveOrder arranges routes per the adaptation's resolved
+	// directive order, including matcher-specificity within one directive.
+	// Used for each site's top-level processing chain.
+	sortByDirectiveOrder subrouteSortMode = iota
+	// sortNestedKeepLocal keeps the written order across different
+	// directives but still orders routes of the same directive (notably
+	// handle) by matcher specificity. Used for handle and its children.
+	sortNestedKeepLocal
+	// sortKeepAllLocal keeps the fully written order. Used for route.
+	sortKeepAllLocal
+)
+
 // buildSubroute turns the config values, which are expected to be routes
 // into a clean and orderly subroute that has all the routes within it.
 // order is the directive ordering in effect for the current adaptation.
-func buildSubroute(routes []ConfigValue, groupCounter counter, needsSorting bool, order []string) (*caddyhttp.Subroute, error) {
-	if needsSorting {
+// validateOrder reports an error for a directive that is not a recognized
+// ordered HTTP handler; route blocks intentionally skip it because they
+// are the documented escape hatch for otherwise-unordered directives.
+func buildSubroute(routes []ConfigValue, groupCounter counter, mode subrouteSortMode, validateOrder bool, order []string) (*caddyhttp.Subroute, error) {
+	if mode == sortByDirectiveOrder || validateOrder {
 		for _, val := range routes {
 			if !slices.Contains(order, val.directive) {
 				return nil, fmt.Errorf("directive '%s' is not an ordered HTTP handler, so it cannot be used here - try placing within a route block or using the order global option", val.directive)
 			}
 		}
+	}
 
+	switch mode {
+	case sortByDirectiveOrder:
 		sortRoutes(routes, order)
+	case sortNestedKeepLocal:
+		sortNestedRoutes(routes)
+	case sortKeepAllLocal:
+		// keep textual order
 	}
 
 	subroute := new(caddyhttp.Subroute)

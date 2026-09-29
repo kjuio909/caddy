@@ -15,7 +15,6 @@
 package httpcaddyfile
 
 import (
-	"slices"
 	"strconv"
 
 	"github.com/caddyserver/certmagic"
@@ -101,6 +100,28 @@ func parseOptHTTPSPort(d *caddyfile.Dispenser, _ any) (any, error) {
 	return httpsPort, nil
 }
 
+// directiveOrderConstraint is one "order" global option declaration. It
+// records a directed relation (or a first/last anchor) on its subject
+// directive together with the location of the declaration, so that all
+// constraints in one adaptation can be merged with the default directive
+// order independently of the order in which the declaration lines appear.
+type directiveOrderConstraint struct {
+	// subject is the directive whose position the declaration constrains.
+	subject string
+
+	// position is Before, After, First, or Last.
+	position Positional
+
+	// anchor is the other directive for Before/After constraints, and
+	// empty for First/Last.
+	anchor string
+
+	// file and line locate the subject token in the source Caddyfile (or
+	// in an imported file), keeping constraint diagnostics actionable.
+	file string
+	line int
+}
+
 func parseOptOrder(d *caddyfile.Dispenser, existingVal any) (any, error) {
 	d.Next() // consume option name
 
@@ -109,22 +130,9 @@ func parseOptOrder(d *caddyfile.Dispenser, existingVal any) (any, error) {
 		return nil, d.ArgErr()
 	}
 	dirName := d.Val()
+	subjectToken := d.Token()
 	if _, ok := registeredDirectives[dirName]; !ok {
 		return nil, d.Errf("%s is not a registered directive", dirName)
-	}
-
-	// Reorder for this adaptation only. A previous "order" global option in
-	// the same adaptation passes its resulting order as existingVal; the
-	// first one builds on the registered baseline. The package-level
-	// directiveOrder is never mutated, so concurrent adaptations cannot leak
-	// their ordering into each other. Copy before rearranging: slices.DeleteFunc
-	// and slices.Insert edit the backing array in place, and the baseline may
-	// be the package-level slice.
-	var baseOrder []string
-	if existing, ok := existingVal.([]string); ok {
-		baseOrder = append(baseOrder, existing...)
-	} else {
-		baseOrder = append(baseOrder, directiveOrder...)
 	}
 
 	// get positional token
@@ -133,57 +141,82 @@ func parseOptOrder(d *caddyfile.Dispenser, existingVal any) (any, error) {
 	}
 	pos := Positional(d.Val())
 
-	// if directive already had an order, drop it
-	newOrder := slices.DeleteFunc(baseOrder, func(d string) bool {
-		return d == dirName
-	})
-
-	// act on the positional; if it's First or Last, we're done right away
+	var anchor string
 	switch pos {
-	case First:
-		newOrder = append([]string{dirName}, newOrder...)
+	case First, Last:
 		if d.NextArg() {
 			return nil, d.ArgErr()
 		}
-		return newOrder, nil
-
-	case Last:
-		newOrder = append(newOrder, dirName)
+	case Before, After:
+		// get name of the other directive
+		if !d.NextArg() {
+			return nil, d.ArgErr()
+		}
+		anchor = d.Val()
 		if d.NextArg() {
 			return nil, d.ArgErr()
 		}
-		return newOrder, nil
-
-	// if it's Before or After, continue
-	case Before:
-	case After:
-
+		if _, ok := registeredDirectives[anchor]; !ok {
+			return nil, d.Errf("%s is not a registered directive", anchor)
+		}
+		if anchor == dirName {
+			return nil, d.Errf("directive '%s' cannot be ordered relative to itself", dirName)
+		}
 	default:
 		return nil, d.Errf("unknown positional '%s'", pos)
 	}
 
-	// get name of other directive
-	if !d.NextArg() {
-		return nil, d.ArgErr()
-	}
-	otherDir := d.Val()
-	if d.NextArg() {
-		return nil, d.ArgErr()
+	constraint := directiveOrderConstraint{
+		subject:  dirName,
+		position: pos,
+		anchor:   anchor,
+		file:     subjectToken.File,
+		line:     subjectToken.Line,
 	}
 
-	// get the position of the target directive
-	targetIndex := slices.Index(newOrder, otherDir)
-	if targetIndex == -1 {
-		return nil, d.Errf("directive '%s' not found", otherDir)
+	// Accumulate every declaration for this adaptation; the resulting
+	// directed graph is only resolved after the whole global options block
+	// has been read, so the output never depends on declaration order.
+	var constraints []directiveOrderConstraint
+	if existing, ok := existingVal.([]directiveOrderConstraint); ok {
+		constraints = existing
 	}
-	// if we're inserting after, we need to increment the index to go after
-	if pos == After {
-		targetIndex++
-	}
-	// insert the directive into the new order
-	newOrder = slices.Insert(newOrder, targetIndex, dirName)
 
-	return newOrder, nil
+	// A pair of directives constrained in both directions can never be
+	// satisfied, so reject it while the offending token is still at hand.
+	if pos == Before || pos == After {
+		newEdgeFrom, newEdgeTo := dirName, anchor
+		if pos == After {
+			newEdgeFrom, newEdgeTo = anchor, dirName
+		}
+		for _, existing := range constraints {
+			if existing.position != Before && existing.position != After {
+				continue
+			}
+			existingFrom, existingTo := existing.subject, existing.anchor
+			if existing.position == After {
+				existingFrom, existingTo = existing.anchor, existing.subject
+			}
+			if existingFrom == newEdgeTo && existingTo == newEdgeFrom {
+				return nil, d.Errf("conflicting directive order: '%s' cannot be both before and after '%s'", newEdgeFrom, newEdgeTo)
+			}
+		}
+	}
+
+	// First and last on the same directive are contradictory anchors.
+	if pos == First || pos == Last {
+		other := First
+		if pos == First {
+			other = Last
+		}
+		for _, existing := range constraints {
+			if existing.subject == dirName && existing.position == other {
+				return nil, d.Errf("conflicting directive order: '%s' cannot be both first and last", dirName)
+			}
+		}
+	}
+
+	return append(constraints, constraint), nil
 }
 
 func parseOptStorage(d *caddyfile.Dispenser, _ any) (any, error) {
