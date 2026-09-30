@@ -873,9 +873,12 @@ func (h adminHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PUT, PATCH, DELETE")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Cache-Control")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Cache-Control, "+ConfigVersionHeader)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
+		// browsers only expose listed response headers to cross-origin
+		// callers, so make the version token readable on every response
+		w.Header().Set("Access-Control-Expose-Headers", ConfigVersionHeader)
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
 
@@ -1017,7 +1020,7 @@ func handleConfig(w http.ResponseWriter, r *http.Request) error {
 		defer bufferPool.Put(buf)
 
 		configWriter := io.MultiWriter(buf, hash)
-		err := readConfig(r.URL.Path, configWriter)
+		version, err := readConfigWithVersion(r.URL.Path, configWriter)
 		if err != nil {
 			return APIError{HTTPStatus: http.StatusBadRequest, Err: err}
 		}
@@ -1025,6 +1028,10 @@ func handleConfig(w http.ResponseWriter, r *http.Request) error {
 		// we could consider setting up a sync.Pool for the summed
 		// hashes to reduce GC pressure.
 		w.Header().Set("Etag", makeEtag(r.URL.Path, hash))
+
+		// expose the opaque token of the configuration that was just
+		// read; callers must echo it back on their next mutating request
+		w.Header().Set(ConfigVersionHeader, version)
 		_, err = w.Write(buf.Bytes())
 		if err != nil {
 			return APIError{HTTPStatus: http.StatusInternalServerError, Err: err}
@@ -1064,12 +1071,30 @@ func handleConfig(w http.ResponseWriter, r *http.Request) error {
 			body = buf.Bytes()
 		}
 
+		// Optimistic concurrency control: every mutation of (or under)
+		// /config/ must carry the token obtained from the most recent
+		// read. A missing or stale token is a precondition failure,
+		// distinct from a bad request body, and leaves the live config,
+		// its token, and in-flight requests untouched.
+		expectedVersion := r.Header.Get(ConfigVersionHeader)
+		if expectedVersion == "" {
+			return APIError{
+				HTTPStatus: http.StatusPreconditionFailed,
+				Err:        fmt.Errorf("missing %s header; read the current configuration to obtain its version token first", ConfigVersionHeader),
+			}
+		}
+
 		forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
 
-		err := changeConfig(r.Method, r.URL.Path, body, r.Header.Get("If-Match"), forceReload)
+		newVersion, err := changeConfig(r.Method, r.URL.Path, body, r.Header.Get("If-Match"), expectedVersion, forceReload)
 		if err != nil && !errors.Is(err, errSameConfig) {
 			return err
 		}
+
+		// return the token that remains usable: a fresh token after a
+		// real replacement, or the same token for an unchanged/idempotent
+		// retry (errSameConfig)
+		w.Header().Set(ConfigVersionHeader, newVersion)
 
 		// If this request changed the config, clear the last
 		// config info we have stored, if it is different from
@@ -1469,6 +1494,14 @@ var errInternalRedir = fmt.Errorf("internal redirect; re-authorization required"
 const (
 	rawConfigKey = "config"
 	idKey        = "@id"
+
+	// ConfigVersionHeader carries the opaque, caller-facing
+	// configuration version token. A GET on /config/ returns the
+	// token valid for the configuration that was read; every
+	// mutating request under /config/ must echo it back, and a
+	// successful replacement returns the token of the new
+	// configuration in the same header.
+	ConfigVersionHeader = "Caddy-Config-Version"
 )
 
 var bufPool = sync.Pool{

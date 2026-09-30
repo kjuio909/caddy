@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 
 	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	// plug in Caddy modules here
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
@@ -62,6 +64,78 @@ type Tester struct {
 	configLoaded bool
 	t            testing.TB
 	config       Config
+
+	// configVersion is the most recently observed opaque config
+	// version token. It is automatically attached to mutating
+	// admin API requests under /config/ or /id/ and refreshed from
+	// each response, so tests don't have to track it themselves.
+	configVersionMu sync.Mutex
+	configVersion   string
+}
+
+// configMutationPath reports whether p targets a config-protected
+// admin endpoint whose mutating methods require a version token.
+func configMutationPath(p string) bool {
+	return p == "/config" || strings.HasPrefix(p, "/config/") ||
+		strings.HasPrefix(p, "/id/")
+}
+
+// fetchConfigVersion reads the current config version token from
+// the admin API. It returns an empty string when the token could
+// not be obtained.
+func (tc *Tester) fetchConfigVersion() string {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%d/config/", tc.config.AdminPort), nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := tc.Client.Do(req) //nolint:gosec // hard-coded localhost admin endpoint
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.Header.Get(caddy.ConfigVersionHeader)
+}
+
+// attachConfigVersion ensures mutating admin config requests carry
+// a current version token, fetching one first if needed.
+func (tc *Tester) attachConfigVersion(req *http.Request) {
+	if !configMutationPath(req.URL.Path) {
+		return
+	}
+	switch req.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+	default:
+		return
+	}
+	if req.Header.Get(caddy.ConfigVersionHeader) != "" {
+		return
+	}
+	tc.configVersionMu.Lock()
+	v := tc.configVersion
+	if v == "" {
+		v = tc.fetchConfigVersion()
+		tc.configVersion = v
+	}
+	tc.configVersionMu.Unlock()
+	if v != "" {
+		req.Header.Set(caddy.ConfigVersionHeader, v)
+	}
+}
+
+// updateConfigVersion records the version token returned by the
+// admin API (if any), re-reading it when the request lost the
+// optimistic-concurrency race.
+func (tc *Tester) updateConfigVersion(resp *http.Response) {
+	tc.configVersionMu.Lock()
+	defer tc.configVersionMu.Unlock()
+	if v := resp.Header.Get(caddy.ConfigVersionHeader); v != "" {
+		tc.configVersion = v
+		return
+	}
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		tc.configVersion = tc.fetchConfigVersion()
+	}
 }
 
 // NewTester will create a new testing client with an attached cookie jar
@@ -506,10 +580,14 @@ func applyHeaders(t testing.TB, req *http.Request, requestHeaders []string) {
 func (tc *Tester) AssertResponseCode(req *http.Request, expectedStatusCode int) *http.Response {
 	tc.t.Helper()
 
+	tc.attachConfigVersion(req)
+
 	resp, err := tc.Client.Do(req) //nolint:gosec // no SSRFs demonstrated
 	if err != nil {
 		tc.t.Fatalf("failed to call server %s", err)
 	}
+
+	tc.updateConfigVersion(resp)
 
 	if expectedStatusCode != resp.StatusCode {
 		tc.t.Errorf("requesting \"%s\" expected status code: %d but got %d", req.URL.RequestURI(), expectedStatusCode, resp.StatusCode)

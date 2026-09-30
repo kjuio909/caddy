@@ -112,6 +112,11 @@ func Run(cfg *Config) error {
 // Load loads the given config JSON and runs it only
 // if it is different from the current config or
 // forceReload is true.
+//
+// As an in-process entry point (also used by the
+// /load endpoint and dynamic config loaders), Load
+// does not participate in the admin API's caller-facing
+// version protection; only the /config/ endpoint does.
 func Load(cfgJSON []byte, forceReload bool) error {
 	if err := notify.Reloading(); err != nil {
 		Log().Error("unable to notify service manager of reloading state", zap.Error(err))
@@ -133,7 +138,7 @@ func Load(cfgJSON []byte, forceReload bool) error {
 		}
 	}()
 
-	err = changeConfig(http.MethodPost, "/"+rawConfigKey, cfgJSON, "", forceReload)
+	_, err = changeConfig(http.MethodPost, "/"+rawConfigKey, cfgJSON, "", "", forceReload)
 	if errors.Is(err, errSameConfig) {
 		err = nil // not really an error
 	}
@@ -148,6 +153,20 @@ func Load(cfgJSON []byte, forceReload bool) error {
 // occur unless forceReload is true. If the config is unchanged and not
 // forcefully reloaded, then errConfigUnchanged is returned. This function
 // is safe for concurrent use.
+//
+// expectedVersion, when non-empty, is the opaque version token obtained
+// from a previous read of the config. The mutation is only applied if it
+// matches the token of the currently-effective configuration; otherwise an
+// APIError with status 412 is returned before any candidate state is built.
+// An empty expectedVersion opts out of the check and is reserved for
+// in-process entry points (Load, the /load endpoint, dynamic config
+// loaders), not for the admin API's /config/ endpoint.
+//
+// On a successful replacement the token of the new configuration is
+// returned. If the config is unchanged, the current token is returned
+// alongside errSameConfig so retried submissions are idempotent and
+// carry no side effects.
+//
 // The ifMatchHeader can optionally be given a string of the format:
 //
 //	"<path> <hash>"
@@ -155,23 +174,34 @@ func Load(cfgJSON []byte, forceReload bool) error {
 // where <path> is the absolute path in the config and <hash> is the expected hash of
 // the config at that path. If the hash in the ifMatchHeader doesn't match
 // the hash of the config, then an APIError with status 412 will be returned.
-func changeConfig(method, path string, input []byte, ifMatchHeader string, forceReload bool) error {
+func changeConfig(method, path string, input []byte, ifMatchHeader, expectedVersion string, forceReload bool) (string, error) {
 	switch method {
 	case http.MethodGet,
 		http.MethodHead,
 		http.MethodOptions,
 		http.MethodConnect,
 		http.MethodTrace:
-		return fmt.Errorf("method not allowed")
+		return "", fmt.Errorf("method not allowed")
 	}
 
 	rawCfgMu.Lock()
 	defer rawCfgMu.Unlock()
 
+	// caller-facing version protection: a stale, missing-at-the-handler,
+	// or otherwise unrecognized token is a failed precondition, distinct
+	// from any error caused by the contents of the candidate config. This
+	// runs before the candidate is parsed or mutated.
+	if expectedVersion != "" && expectedVersion != rawCfgVersion {
+		return "", APIError{
+			HTTPStatus: http.StatusPreconditionFailed,
+			Err:        fmt.Errorf("configuration version token does not match the current configuration"),
+		}
+	}
+
 	if ifMatchHeader != "" {
 		// expect the first and last character to be quotes
 		if len(ifMatchHeader) < 2 || ifMatchHeader[0] != '"' || ifMatchHeader[len(ifMatchHeader)-1] != '"' {
-			return APIError{
+			return "", APIError{
 				HTTPStatus: http.StatusBadRequest,
 				Err:        fmt.Errorf("malformed If-Match header; expect quoted string"),
 			}
@@ -180,7 +210,7 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 		// read out the parts
 		parts := strings.Fields(ifMatchHeader[1 : len(ifMatchHeader)-1])
 		if len(parts) != 2 {
-			return APIError{
+			return "", APIError{
 				HTTPStatus: http.StatusBadRequest,
 				Err:        fmt.Errorf("malformed If-Match header; expect format \"<path> <hash>\""),
 			}
@@ -191,88 +221,133 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 		hash := etagHasher()
 		err := unsyncedConfigAccess(http.MethodGet, parts[0], nil, hash)
 		if err != nil {
-			return err
+			var apiErr APIError
+			if errors.As(err, &apiErr) {
+				return "", err
+			}
+			return "", APIError{HTTPStatus: http.StatusBadRequest, Err: err}
 		}
 
 		if hex.EncodeToString(hash.Sum(nil)) != parts[1] {
-			return APIError{
+			return "", APIError{
 				HTTPStatus: http.StatusPreconditionFailed,
 				Err:        fmt.Errorf("If-Match header did not match current config hash"),
 			}
 		}
 	}
 
-	err := unsyncedConfigAccess(method, path, input, nil)
-	if err != nil {
-		return err
+	// deleting the entire configuration leaves Caddy with no running apps
+	// and no admin endpoint to recover with, so reject it as an input
+	// error before building any candidate state
+	if method == http.MethodDelete && strings.Trim(path, "/") == rawConfigKey {
+		return "", APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("cannot delete the root configuration"),
+		}
+	}
+
+	// Build the candidate on a private copy: the effective configuration
+	// must never expose a partially mutated tree while parsing, indexing,
+	// provisioning, validation, and the runtime switch are in progress.
+	// rawCfgJSON is the exact JSON of what is currently effective, so a
+	// fresh unmarshal gives a fully detached deep copy.
+	liveCfg := rawCfg[rawConfigKey]
+	var candidate any
+	if len(rawCfgJSON) > 0 {
+		if err := json.Unmarshal(rawCfgJSON, &candidate); err != nil {
+			return "", fmt.Errorf("copying current config: %v", err)
+		}
+	}
+	rawCfg[rawConfigKey] = candidate
+
+	// any failure from here on restores the untouched effective config
+	// and keeps the original version token valid
+	restoreLiveCfg := func() {
+		rawCfg[rawConfigKey] = liveCfg
+	}
+
+	if err := unsyncedConfigAccess(method, path, input, nil); err != nil {
+		restoreLiveCfg()
+		// traversal failures (missing path, type mismatch, bad array
+		// index, malformed body) are client input errors, not server
+		// faults; keep already-classified statuses such as 404/409
+		var apiErr APIError
+		if errors.As(err, &apiErr) {
+			return "", err
+		}
+		return "", APIError{HTTPStatus: http.StatusBadRequest, Err: err}
 	}
 
 	// the mutation is complete, so encode the entire config as JSON
 	newCfg, err := json.Marshal(rawCfg[rawConfigKey])
 	if err != nil {
-		return APIError{
+		restoreLiveCfg()
+		return "", APIError{
 			HTTPStatus: http.StatusBadRequest,
 			Err:        fmt.Errorf("encoding new config: %v", err),
 		}
 	}
 
-	// if nothing changed, no need to do a whole reload unless the client forces it
+	// if nothing changed, no need to do a whole reload unless the client
+	// forces it; this also makes retried submissions against a still-matching
+	// version idempotent: no second reload, and the same token is returned
 	if !forceReload && bytes.Equal(rawCfgJSON, newCfg) {
+		restoreLiveCfg()
 		Log().Info("config is unchanged")
-		return errSameConfig
+		return rawCfgVersion, errSameConfig
 	}
 
 	// find any IDs in this config and index them
 	idx := make(map[string]string)
-	err = indexConfigObjects(rawCfg[rawConfigKey], "/"+rawConfigKey, idx)
-	if err != nil {
-		if len(rawCfgJSON) > 0 {
-			var oldCfg any
-			err2 := json.Unmarshal(rawCfgJSON, &oldCfg)
-			if err2 != nil {
-				err = fmt.Errorf("%v; additionally, restoring old config: %v", err, err2)
-			}
-			rawCfg[rawConfigKey] = oldCfg
-		} else {
-			rawCfg[rawConfigKey] = nil
-		}
-		return APIError{
+	if err := indexConfigObjects(rawCfg[rawConfigKey], "/"+rawConfigKey, idx); err != nil {
+		restoreLiveCfg()
+		return "", APIError{
 			HTTPStatus: http.StatusBadRequest,
 			Err:        fmt.Errorf("indexing config: %v", err),
 		}
 	}
 
-	// load this new config; if it fails, we need to revert to
-	// our old representation of caddy's actual config
-	err = unsyncedDecodeAndRun(newCfg, true)
-	if err != nil {
-		if len(rawCfgJSON) > 0 {
-			// restore old config state to keep it consistent
-			// with what caddy is still running; we need to
-			// unmarshal it again because it's likely that
-			// pointers deep in our rawCfg map were modified
-			var oldCfg any
-			err2 := json.Unmarshal(rawCfgJSON, &oldCfg)
-			if err2 != nil {
-				err = fmt.Errorf("%v; additionally, restoring old config: %v", err, err2)
-			}
-			rawCfg[rawConfigKey] = oldCfg
-		} else {
-			rawCfg[rawConfigKey] = nil
+	// load this new config; parsing, validation, module preparation, and
+	// the runtime switch all happen in unsyncedDecodeAndRun. If any of
+	// them fail, the old config and old token stay effective: the live
+	// tree was never modified (only the detached candidate was), and
+	// run() itself tears down anything it partially started. Failures
+	// here stem from the candidate configuration, so they are reported
+	// as client errors (400), distinct from version precondition
+	// failures (412).
+	if err := unsyncedDecodeAndRun(newCfg, true); err != nil {
+		restoreLiveCfg()
+		return "", APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("loading new config: %v", err),
 		}
-
-		return fmt.Errorf("loading new config: %v", err)
 	}
 
-	// success, so update our stored copy of the encoded
-	// config to keep it consistent with what caddy is now
-	// running (storing an encoded copy is not strictly
-	// necessary, but avoids an extra json.Marshal for
-	// each config change)
+	// success: commit the candidate, its encoded form and index, and mint
+	// a fresh opaque token together. Subsequent requests see the complete
+	// new config and only the new token; the old token can never match again.
 	rawCfgJSON = newCfg
 	rawCfgIndex = idx
+	rawCfgVersion = newConfigVersion()
 
-	return nil
+	return rawCfgVersion, nil
+}
+
+// currentConfigVersion returns the opaque token of the currently
+// effective configuration. It changes on every successful replacement,
+// even when the new configuration has identical contents.
+func currentConfigVersion() string {
+	rawCfgMu.RLock()
+	defer rawCfgMu.RUnlock()
+	return rawCfgVersion
+}
+
+// newConfigVersion mints a new opaque configuration version token.
+// Tokens are random and unrelated to the config contents, so two
+// successive versions with identical contents still get distinct
+// tokens and a token cannot be guessed from a config document.
+func newConfigVersion() string {
+	return uuid.NewString()
 }
 
 // readConfig traverses the current config to path
@@ -281,6 +356,20 @@ func readConfig(path string, out io.Writer) error {
 	rawCfgMu.RLock()
 	defer rawCfgMu.RUnlock()
 	return unsyncedConfigAccess(http.MethodGet, path, nil, out)
+}
+
+// readConfigWithVersion behaves like readConfig but additionally
+// returns the opaque version token of the configuration that was
+// read. The encoded subtree and the token are captured under the
+// same read lock, so they are guaranteed to describe the same
+// effective configuration.
+func readConfigWithVersion(path string, out io.Writer) (string, error) {
+	rawCfgMu.RLock()
+	defer rawCfgMu.RUnlock()
+	if err := unsyncedConfigAccess(http.MethodGet, path, nil, out); err != nil {
+		return "", err
+	}
+	return rawCfgVersion, nil
 }
 
 // indexConfigObjects recursively searches ptr for object fields named
@@ -620,7 +709,7 @@ func finishSettingUp(ctx Context, cfg *Config) error {
 
 		runLoadedConfig := func(config []byte) error {
 			logger.Info("applying dynamically-loaded config")
-			err := changeConfig(http.MethodPost, "/"+rawConfigKey, config, "", false)
+			_, err := changeConfig(http.MethodPost, "/"+rawConfigKey, config, "", "", false)
 			if errors.Is(err, errSameConfig) {
 				return err
 			}
@@ -706,6 +795,7 @@ func Stop() error {
 	rawCfgJSON = nil
 	rawCfgIndex = nil
 	rawCfg[rawConfigKey] = nil
+	rawCfgVersion = newConfigVersion()
 	rawCfgMu.Unlock()
 
 	return nil
@@ -1228,6 +1318,14 @@ var (
 	// rawCfgIndex is the map of user-assigned ID to expanded
 	// path, for converting /id/ paths to /config/ paths.
 	rawCfgIndex map[string]string
+
+	// rawCfgVersion is the opaque token of the currently
+	// effective configuration. It is never derived from the
+	// config contents: a replacement that results in identical
+	// contents still mints a different token, so callers cannot
+	// guess a valid token from the config body. It is swapped
+	// atomically together with rawCfg, rawCfgJSON, and rawCfgIndex.
+	rawCfgVersion = newConfigVersion()
 
 	// rawCfgMu protects all the rawCfg fields and also
 	// essentially synchronizes config changes/reloads.
