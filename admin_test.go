@@ -29,6 +29,7 @@ import (
 	"os"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,7 +64,6 @@ func (k testAdminPublicKey) Equal(x crypto.PublicKey) bool {
 	other, ok := x.(testAdminPublicKey)
 	return ok && k == other
 }
-
 func TestUnsyncedConfigAccess(t *testing.T) {
 	// each test is performed in sequence, so
 	// each change builds on the previous ones;
@@ -171,10 +171,10 @@ func TestLoadConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-type fooModule struct {
-	IntField int
-	StrField string
-}
+// fooModule is a minimal app used by config-version tests as a legal
+// subtree to mutate; it accepts arbitrary JSON and has no runtime
+// side effects.
+type fooModule struct{}
 
 func (fooModule) CaddyModule() ModuleInfo {
 	return ModuleInfo{
@@ -185,43 +185,354 @@ func (fooModule) CaddyModule() ModuleInfo {
 func (fooModule) Start() error { return nil }
 func (fooModule) Stop() error  { return nil }
 
-func TestETags(t *testing.T) {
-	RegisterModule(fooModule{})
+// UnmarshalJSON accepts anything so tests can add arbitrary subtrees
+// under apps.foo without failing strict config decoding.
+func (*fooModule) UnmarshalJSON([]byte) error { return nil }
 
-	if err := Load([]byte(`{"admin": {"listen": "localhost:2999"}, "apps": {"foo": {"strField": "abc", "intField": 0}}}`), true); err != nil {
-		t.Fatalf("loading: %s", err)
+var fooModuleRegistered sync.Once
+
+func TestConfigVersionTokens(t *testing.T) {
+	fooModuleRegistered.Do(func() { RegisterModule(fooModule{}) })
+
+	// admin endpoint is disabled so commits do not bind a real listener;
+	// successful changes still run the whole prepare/provision pipeline
+	const baseConfig = `{"admin":{"disabled":true},"apps":{"foo":{}}}`
+	const rootPath = "/" + rawConfigKey + "/"
+	const fooPath = "/" + rawConfigKey + "/apps/foo"
+
+	if err := Load([]byte(baseConfig), true); err != nil {
+		t.Fatalf("loading base config: %s", err)
+	}
+	t.Cleanup(func() { _ = Stop() })
+
+	readRoot := func(t *testing.T) (string, []byte) {
+		t.Helper()
+		var buf bytes.Buffer
+		token, err := readConfig(rootPath, &buf)
+		if err != nil {
+			t.Fatalf("reading config: %s", err)
+		}
+		if token == "" {
+			t.Fatal("expected non-empty version token on read")
+		}
+		return token, buf.Bytes()
 	}
 
-	const key = "/" + rawConfigKey + "/apps/foo"
-
-	// try update the config with the wrong etag
-	err := changeConfig(http.MethodPost, key, []byte(`{"strField": "abc", "intField": 1}}`), fmt.Sprintf(`"/%s not_an_etag"`, rawConfigKey), false)
-	if apiErr, ok := err.(APIError); !ok || apiErr.HTTPStatus != http.StatusPreconditionFailed {
-		t.Fatalf("expected precondition failed; got %v", err)
+	expectPrecondition := func(t *testing.T, err error) {
+		t.Helper()
+		var apiErr APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("expected APIError, got %T: %v", err, err)
+		}
+		if apiErr.HTTPStatus != http.StatusPreconditionFailed {
+			t.Fatalf("expected 412 precondition failed, got %d: %v", apiErr.HTTPStatus, err)
+		}
 	}
 
-	// get the etag
-	hash := etagHasher()
-	if err := readConfig(key, hash); err != nil {
-		t.Fatalf("reading: %s", err)
+	expectStatus := func(t *testing.T, want int, err error) {
+		t.Helper()
+		var apiErr APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("expected APIError with status %d, got %T: %v", want, err, err)
+		}
+		if apiErr.HTTPStatus != want {
+			t.Fatalf("expected status %d, got %d: %v", want, apiErr.HTTPStatus, err)
+		}
 	}
 
-	// do the same update with the correct key
-	err = changeConfig(http.MethodPost, key, []byte(`{"strField": "abc", "intField": 1}`), makeEtag(key, hash), false)
+	t1, body1 := readRoot(t)
+
+	// the token must be opaque: it cannot be derivable from the body
+	if bytes.Contains(body1, []byte(t1)) {
+		t.Fatal("version token appears in the config body")
+	}
+
+	// a token that never existed is a failed precondition; the
+	// check runs before path traversal, so the nonexistent path
+	// here is irrelevant
+	_, err := changeConfig(http.MethodPost, rootPath+"marker", []byte(`"a"`), "00000000-0000-0000-0000-000000000000", false)
+	expectPrecondition(t, err)
+
+	// successful subtree creation rotates the token ...
+	t2, err := changeConfig(http.MethodPut, fooPath+"/marker", []byte(`{"nested":"v1"}`), t1, false)
 	if err != nil {
-		t.Fatalf("expected update to work; got %v", err)
+		t.Fatalf("creating subtree: %v", err)
+	}
+	if t2 == "" || t2 == t1 {
+		t.Fatalf("expected new token after successful change, got %q (old %q)", t2, t1)
 	}
 
-	// now try another update. The hash should no longer match and we should get precondition failed
-	err = changeConfig(http.MethodPost, key, []byte(`{"strField": "abc", "intField": 2}`), makeEtag(key, hash), false)
-	if apiErr, ok := err.(APIError); !ok || apiErr.HTTPStatus != http.StatusPreconditionFailed {
-		t.Fatalf("expected precondition failed; got %v", err)
+	// ... and a read observes the new content together with the new token
+	gotToken, gotBody := readRoot(t)
+	if gotToken != t2 {
+		t.Fatalf("read token %q does not match committed token %q", gotToken, t2)
 	}
+	if !bytes.Contains(gotBody, []byte(`"nested":"v1"`)) {
+		t.Fatalf("new content not visible after commit: %s", gotBody)
+	}
+
+	// after one successful whole-config replacement, another caller
+	// still holding the old token cannot modify a subtree
+	t3, err := changeConfig(http.MethodPost, rootPath, []byte(baseConfig), t2, true)
+	if err != nil {
+		t.Fatalf("replacing whole config: %v", err)
+	}
+	if t3 == t2 {
+		t.Fatal("expected token to rotate on whole-config replacement")
+	}
+	_, err = changeConfig(http.MethodPatch, fooPath+"/marker/nested", []byte(`"stale"`), t2, false)
+	expectPrecondition(t, err)
+
+	// and vice versa: a subtree change rotates the token, after which
+	// the previous token cannot drive a whole replacement
+	t4, err := changeConfig(http.MethodPost, fooPath+"/marker2", []byte(`1`), t3, false)
+	if err != nil {
+		t.Fatalf("subtree change: %v", err)
+	}
+	_, err = changeConfig(http.MethodPost, rootPath, []byte(baseConfig), t3, false)
+	expectPrecondition(t, err)
+
+	// identical content committed as a new version (force reload) still
+	// gets a fresh token: tokens are never derived from content
+	t5, err := changeConfig(http.MethodPost, rootPath, []byte(baseConfig), t4, true)
+	if err != nil {
+		t.Fatalf("force reload of identical config: %v", err)
+	}
+	if t5 == t4 {
+		t.Fatal("identical consecutive versions must not share a token")
+	}
+	_, bodyAfterSame := readRoot(t)
+	if !bytes.Equal(bytes.TrimSpace(bodyAfterSame), []byte(baseConfig)) {
+		t.Fatalf("expected identical config, got %s", bodyAfterSame)
+	}
+
+	// resubmitting an unchanged write against the current token is a
+	// no-op: errSameConfig, the same token, and no second side effect
+	t5m, err := changeConfig(http.MethodPost, fooPath+"/marker2", []byte(`1`), t5, false)
+	if err != nil {
+		t.Fatalf("creating value for idempotent retry: %v", err)
+	}
+	sameToken, err := changeConfig(http.MethodPost, fooPath+"/marker2", []byte(`1`), t5m, false)
+	if !errors.Is(err, errSameConfig) {
+		t.Fatalf("expected errSameConfig on retry, got %v", err)
+	}
+	if sameToken != t5m {
+		t.Fatalf("retry must not rotate token: got %q, want %q", sameToken, t5m)
+	}
+
+	// malformed candidate JSON: input error, state and token untouched
+	beforeTok, beforeBody := readRoot(t)
+	if beforeTok != t5m {
+		t.Fatalf("setup: expected token %q, got %q", t5m, beforeTok)
+	}
+	_, err = changeConfig(http.MethodPost, fooPath+"/broken", []byte(`{not valid json`), t5m, false)
+	expectStatus(t, http.StatusBadRequest, err)
+	afterTok, afterBody := readRoot(t)
+	if afterTok != beforeTok || !bytes.Equal(afterBody, beforeBody) {
+		t.Fatal("malformed JSON changed the configuration")
+	}
+
+	// candidate that fails runtime preparation (unknown app module):
+	// the running config, raw state and token must all survive
+	_, err = changeConfig(http.MethodPost, rootPath,
+		[]byte(`{"admin":{"disabled":true},"apps":{"definitely_not_a_module_xyz":{}}}`), t5m, false)
+	if err == nil {
+		t.Fatal("expected error loading config with unknown app module")
+	}
+	afterTok, afterBody = readRoot(t)
+	if afterTok != beforeTok {
+		t.Fatalf("token changed after failed reload: got %q, want %q", afterTok, beforeTok)
+	}
+	if !bytes.Equal(afterBody, beforeBody) {
+		t.Fatalf("config changed after failed reload:\n%s\nwant\n%s", afterBody, beforeBody)
+	}
+
+	// the still-current token remains usable after those failures
+	t6, err := changeConfig(http.MethodPost, fooPath+"/recovered", []byte(`true`), t5m, false)
+	if err != nil {
+		t.Fatalf("change after failed candidates should succeed with same token: %v", err)
+	}
+
+	// boundary: deleting the root configuration is an input error
+	_, err = changeConfig(http.MethodDelete, rootPath, nil, t6, false)
+	expectStatus(t, http.StatusBadRequest, err)
+	_, err = changeConfig(http.MethodDelete, "/"+rawConfigKey, nil, t6, false)
+	expectStatus(t, http.StatusBadRequest, err)
+
+	// boundary: PATCHing through a scalar parent is a bad request
+	_, err = changeConfig(http.MethodPatch, fooPath+"/recovered/does/not/exist", []byte(`1`), t6, false)
+	expectStatus(t, http.StatusBadRequest, err)
+	t7, err := changeConfig(http.MethodPut, fooPath+"/typed", []byte(`{"a":1}`), t6, false)
+	if err != nil {
+		t.Fatalf("creating typed subtree: %v", err)
+	}
+	// PUT to an existing key is a conflict, PATCH a missing map key is
+	// a not-found, and traversing through an existing scalar is a bad
+	// request -- all distinguishable input errors, all non-mutating
+	_, err = changeConfig(http.MethodPut, fooPath+"/typed", []byte(`{"a":2}`), t7, false)
+	expectStatus(t, http.StatusConflict, err)
+	_, err = changeConfig(http.MethodPatch, fooPath+"/typed/missing", []byte(`1`), t7, false)
+	expectStatus(t, http.StatusNotFound, err)
+	_, err = changeConfig(http.MethodPut, fooPath+"/typed/a/deeper", []byte(`1`), t7, false)
+	expectStatus(t, http.StatusBadRequest, err)
+	t8, err := changeConfig(http.MethodPost, fooPath+"/nums", []byte(`[1,2,3]`), t7, false)
+	if err != nil {
+		t.Fatalf("creating array: %v", err)
+	}
+	_, err = changeConfig(http.MethodDelete, fooPath+"/nums/9", nil, t8, false)
+	expectStatus(t, http.StatusBadRequest, err)
+
+	// none of the failed boundary operations moved the state
+	if tok, body := readRoot(t); tok != t8 || !bytes.Contains(body, []byte(`"nums"`)) {
+		t.Fatalf("state changed after failed boundary operations: token %q body %s", tok, body)
+	}
+
+	// concurrency: many callers submit with the same token; exactly one
+	// wins and commits, every other submission fails the precondition,
+	// and a final read shows one consistent config with one token
+	const n = 50
+	var winners, losers int64
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			_, err := changeConfig(http.MethodPost, rootPath, []byte(baseConfig), t8, true)
+			switch {
+			case err == nil:
+				atomic.AddInt64(&winners, 1)
+			case errors.Is(err, errConfigVersionMismatch):
+				atomic.AddInt64(&losers, 1)
+			default:
+				t.Errorf("unexpected concurrent result: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+	if winners != 1 || losers != n-1 {
+		t.Fatalf("expected exactly 1 winner and %d losers, got %d winners and %d losers", n-1, winners, losers)
+	}
+	finalTok, _ := readRoot(t)
+	if finalTok == t8 {
+		t.Fatal("winning commit did not rotate the token")
+	}
+	// the old token is definitively dead after the serialized race
+	_, err = changeConfig(http.MethodPost, rootPath+"late", []byte(`1`), t8, false)
+	expectPrecondition(t, err)
 }
 
 func BenchmarkLoad(b *testing.B) {
 	for b.Loop() {
 		Load(testCfg, true)
+	}
+}
+
+// TestHandleConfigVersionHeader exercises the version token over the
+// HTTP boundary of the /config/ endpoint: a read hands out the token,
+// writes must echo it, and failures leave the token in place.
+func TestHandleConfigVersionHeader(t *testing.T) {
+	fooModuleRegistered.Do(func() { RegisterModule(fooModule{}) })
+
+	const configPath = "/" + rawConfigKey + "/apps/foo"
+	if err := Load([]byte(`{"admin":{"disabled":true},"apps":{"foo":{}}}`), true); err != nil {
+		t.Fatalf("loading config: %s", err)
+	}
+	t.Cleanup(func() { _ = Stop() })
+
+	// build a real admin mux so APIError responses are rendered with
+	// their status codes, as the wrapper around handleConfig does
+	addr, err := ParseNetworkAddress("localhost:2019")
+	if err != nil {
+		t.Fatalf("parsing admin address: %v", err)
+	}
+	adminHandler, err := (&AdminConfig{Listen: "localhost:2019"}).newAdminHandler(addr, false, Context{})
+	if err != nil {
+		t.Fatalf("creating admin handler: %v", err)
+	}
+
+	doRequest := func(t *testing.T, method, path, token string, body []byte) *httptest.ResponseRecorder {
+		t.Helper()
+		var r *http.Request
+		if body != nil {
+			r = httptest.NewRequest(method, "http://localhost:2019"+path, bytes.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+		} else {
+			r = httptest.NewRequest(method, "http://localhost:2019"+path, nil)
+		}
+		if token != "" {
+			r.Header.Set(ConfigVersionHeader, token)
+		}
+		rr := httptest.NewRecorder()
+		adminHandler.ServeHTTP(rr, r)
+		return rr
+	}
+
+	// a read includes the opaque token
+	rr := doRequest(t, http.MethodGet, configPath, "", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 on read, got %d: %s", rr.Code, rr.Body.String())
+	}
+	v1 := rr.Header().Get(ConfigVersionHeader)
+	if v1 == "" {
+		t.Fatal("read response is missing the version token header")
+	}
+
+	// writes without a token fail the precondition before any content
+	// is considered
+	rr = doRequest(t, http.MethodPost, configPath+"/a", "", []byte(`1`))
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412 without token, got %d", rr.Code)
+	}
+
+	// an unknown token fails too
+	rr = doRequest(t, http.MethodPost, configPath+"/a", "not-a-real-token", []byte(`1`))
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412 with unknown token, got %d", rr.Code)
+	}
+
+	// a precondition failure must not move the token
+	rr = doRequest(t, http.MethodGet, configPath, "", nil)
+	if got := rr.Header().Get(ConfigVersionHeader); got != v1 {
+		t.Fatalf("token changed after failed writes: got %q, want %q", got, v1)
+	}
+
+	// a write with the current token succeeds and returns a new token
+	rr = doRequest(t, http.MethodPost, configPath+"/a", v1, []byte(`1`))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 on valid write, got %d: %s", rr.Code, rr.Body.String())
+	}
+	v2 := rr.Header().Get(ConfigVersionHeader)
+	if v2 == "" || v2 == v1 {
+		t.Fatalf("expected rotated token on success, got %q (old %q)", v2, v1)
+	}
+
+	// the next read shows both the new content and the new token
+	rr = doRequest(t, http.MethodGet, configPath, "", nil)
+	if got := rr.Header().Get(ConfigVersionHeader); got != v2 {
+		t.Fatalf("read token %q does not match write token %q", got, v2)
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte(`"a":1`)) {
+		t.Fatalf("committed content not visible: %s", rr.Body.String())
+	}
+
+	// the old token can no longer drive a write
+	rr = doRequest(t, http.MethodDelete, configPath+"/a", v1, nil)
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412 with stale token, got %d", rr.Code)
+	}
+
+	// deleting the root config is an input error, not a precondition
+	rr = doRequest(t, http.MethodDelete, "/"+rawConfigKey+"/", v2, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 deleting root config, got %d", rr.Code)
+	}
+
+	// malformed JSON is a content error (400), distinguishable from 412
+	rr = doRequest(t, http.MethodPost, configPath+"/b", v2, []byte(`{bad`))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on malformed JSON, got %d", rr.Code)
+	}
+	rr = doRequest(t, http.MethodGet, configPath, "", nil)
+	if got := rr.Header().Get(ConfigVersionHeader); got != v2 {
+		t.Fatalf("token changed after a 400 content error: got %q, want %q", got, v2)
 	}
 }
 
@@ -349,6 +660,7 @@ func TestAdminHandlerBuiltinRouteErrors(t *testing.T) {
 		name           string
 		path           string
 		method         string
+		headers        map[string]string
 		expectedStatus int
 	}{
 		{
@@ -358,9 +670,12 @@ func TestAdminHandlerBuiltinRouteErrors(t *testing.T) {
 			expectedStatus: http.StatusMethodNotAllowed,
 		},
 		{
-			name:           "config endpoint wrong content-type",
-			path:           "/config/",
-			method:         http.MethodPost,
+			name:   "config endpoint wrong content-type",
+			path:   "/config/",
+			method: http.MethodPost,
+			// a valid token passes the version precondition so the
+			// request reaches content-type validation
+			headers:        map[string]string{ConfigVersionHeader: rawCfgVersion},
 			expectedStatus: http.StatusBadRequest,
 		},
 		{
@@ -374,6 +689,9 @@ func TestAdminHandlerBuiltinRouteErrors(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			req := httptest.NewRequest(test.method, fmt.Sprintf("http://localhost:2019%s", test.path), nil)
+			for k, v := range test.headers {
+				req.Header.Set(k, v)
+			}
 			rr := httptest.NewRecorder()
 
 			handler.ServeHTTP(rr, req)

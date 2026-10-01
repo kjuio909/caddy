@@ -25,7 +25,6 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
-	"hash"
 	"io"
 	"net"
 	"net/http"
@@ -41,7 +40,6 @@ import (
 	"time"
 
 	"github.com/caddyserver/certmagic"
-	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -873,9 +871,12 @@ func (h adminHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PUT, PATCH, DELETE")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Cache-Control")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Cache-Control, "+ConfigVersionHeader)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
+		// let browser-side callers read the opaque version token on
+		// config responses so they can echo it back on their next write
+		w.Header().Set("Access-Control-Expose-Headers", ConfigVersionHeader)
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
 
@@ -985,46 +986,42 @@ func (h adminHandler) originAllowed(origin *url.URL) bool {
 	return false
 }
 
-// etagHasher returns the hasher we used on the config to both
-// produce and verify ETags.
-func etagHasher() hash.Hash { return xxhash.New() }
-
-// makeEtag returns an Etag header value (including quotes) for
-// the given config path and hash of contents at that path.
-func makeEtag(path string, hash hash.Hash) string {
-	return fmt.Sprintf(`"%s %x"`, path, hash.Sum(nil))
-}
-
 // This buffer pool is used to keep buffers for
-// reading the config file during eTag header generation
+// reading the config file during config reads
 var bufferPool = sync.Pool{
 	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
 
+// ConfigVersionHeader carries the opaque config version token.
+// Responses to GET /config/... include the token of the config
+// that was just read; mutating requests (POST, PUT, PATCH, DELETE)
+// must echo back the token from their most recent read. The server
+// rejects the request with 412 Precondition Failed if the token is
+// missing or no longer current. A successful response carries the
+// token of the newly-active config. The token is random per version
+// and cannot be derived from (or compared by inspecting) the config.
+const ConfigVersionHeader = "Caddy-Config-Version"
+
 func handleConfig(w http.ResponseWriter, r *http.Request) error {
 	switch r.Method {
 	case http.MethodGet:
 		w.Header().Set("Content-Type", "application/json")
-		hash := etagHasher()
 
 		// Read the config into a buffer instead of writing directly to
-		// the response writer, as we want to set the ETag as the header,
-		// not the trailer.
+		// the response writer, as we want to set the version token as
+		// a header before the body is written.
 		buf := bufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
 		defer bufferPool.Put(buf)
 
-		configWriter := io.MultiWriter(buf, hash)
-		err := readConfig(r.URL.Path, configWriter)
+		version, err := readConfig(r.URL.Path, buf)
 		if err != nil {
 			return APIError{HTTPStatus: http.StatusBadRequest, Err: err}
 		}
 
-		// we could consider setting up a sync.Pool for the summed
-		// hashes to reduce GC pressure.
-		w.Header().Set("Etag", makeEtag(r.URL.Path, hash))
+		w.Header().Set(ConfigVersionHeader, version)
 		_, err = w.Write(buf.Bytes())
 		if err != nil {
 			return APIError{HTTPStatus: http.StatusInternalServerError, Err: err}
@@ -1036,6 +1033,17 @@ func handleConfig(w http.ResponseWriter, r *http.Request) error {
 		http.MethodPut,
 		http.MethodPatch,
 		http.MethodDelete:
+
+		// every mutation must carry the opaque token of the config the
+		// caller last read; this precondition is checked before the
+		// request contents so a missing, stale or unknown token always
+		// fails with 412, distinguishable from any error about the
+		// request or candidate contents (4xx), and without touching the
+		// current configuration
+		versionToken := r.Header.Get(ConfigVersionHeader)
+		if versionToken == "" {
+			return errConfigVersionMismatch
+		}
 
 		// DELETE does not use a body, but the others do
 		var body []byte
@@ -1066,10 +1074,15 @@ func handleConfig(w http.ResponseWriter, r *http.Request) error {
 
 		forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
 
-		err := changeConfig(r.Method, r.URL.Path, body, r.Header.Get("If-Match"), forceReload)
+		newToken, err := changeConfig(r.Method, r.URL.Path, body, versionToken, forceReload)
 		if err != nil && !errors.Is(err, errSameConfig) {
 			return err
 		}
+
+		// report the token of the config now in effect (which equals
+		// the submitted one if the config was unchanged); the client
+		// can carry this into its next request without re-reading
+		w.Header().Set(ConfigVersionHeader, newToken)
 
 		// If this request changed the config, clear the last
 		// config info we have stored, if it is different from

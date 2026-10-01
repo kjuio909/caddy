@@ -133,7 +133,9 @@ func Load(cfgJSON []byte, forceReload bool) error {
 		}
 	}()
 
-	err = changeConfig(http.MethodPost, "/"+rawConfigKey, cfgJSON, "", forceReload)
+	// Internal callers are not API clients: they pass no version
+	// token and bypass the optimistic-concurrency check.
+	_, err = changeConfig(http.MethodPost, "/"+rawConfigKey, cfgJSON, "", forceReload)
 	if errors.Is(err, errSameConfig) {
 		err = nil // not really an error
 	}
@@ -148,139 +150,171 @@ func Load(cfgJSON []byte, forceReload bool) error {
 // occur unless forceReload is true. If the config is unchanged and not
 // forcefully reloaded, then errConfigUnchanged is returned. This function
 // is safe for concurrent use.
-// The ifMatchHeader can optionally be given a string of the format:
 //
-//	"<path> <hash>"
+// versionToken is the opaque config version the caller last observed
+// (see ConfigVersionHeader). For API-driven changes it must be present
+// and equal to the token of the config currently in effect; otherwise an
+// APIError with status 412 (Precondition Failed) is returned and no part
+// of the current configuration, nor its token, is modified. An empty
+// token skips the check; it is reserved for non-API, in-process callers.
 //
-// where <path> is the absolute path in the config and <hash> is the expected hash of
-// the config at that path. If the hash in the ifMatchHeader doesn't match
-// the hash of the config, then an APIError with status 412 will be returned.
-func changeConfig(method, path string, input []byte, ifMatchHeader string, forceReload bool) error {
+// On success the returned token identifies the newly-active config and
+// can be used on subsequent requests. The token is never derived from the
+// config contents, so two consecutive versions with identical configs
+// still carry different tokens.
+func changeConfig(method, path string, input []byte, versionToken string, forceReload bool) (string, error) {
 	switch method {
 	case http.MethodGet,
 		http.MethodHead,
 		http.MethodOptions,
 		http.MethodConnect,
 		http.MethodTrace:
-		return fmt.Errorf("method not allowed")
+		return "", fmt.Errorf("method not allowed")
 	}
 
 	rawCfgMu.Lock()
 	defer rawCfgMu.Unlock()
 
-	if ifMatchHeader != "" {
-		// expect the first and last character to be quotes
-		if len(ifMatchHeader) < 2 || ifMatchHeader[0] != '"' || ifMatchHeader[len(ifMatchHeader)-1] != '"' {
-			return APIError{
+	// optimistic concurrency check: the whole configuration, including
+	// every subtree, is guarded by a single opaque version token, and
+	// the check runs while holding the write lock that serializes all
+	// config changes; it precedes any validation of the operation so a
+	// stale or missing token is always reported as a precondition
+	// failure rather than as an error about the request contents
+	if versionToken != "" && versionToken != rawCfgVersion {
+		return "", errConfigVersionMismatch
+	}
+
+	// deleting the root config would leave Caddy without a traversable
+	// configuration; the supported way to stop running apps is Stop()
+	if method == http.MethodDelete {
+		if cleanPath := strings.Trim(path, "/"); cleanPath == "" || cleanPath == rawConfigKey {
+			return "", APIError{
 				HTTPStatus: http.StatusBadRequest,
-				Err:        fmt.Errorf("malformed If-Match header; expect quoted string"),
-			}
-		}
-
-		// read out the parts
-		parts := strings.Fields(ifMatchHeader[1 : len(ifMatchHeader)-1])
-		if len(parts) != 2 {
-			return APIError{
-				HTTPStatus: http.StatusBadRequest,
-				Err:        fmt.Errorf("malformed If-Match header; expect format \"<path> <hash>\""),
-			}
-		}
-
-		// get the current hash of the config
-		// at the given path
-		hash := etagHasher()
-		err := unsyncedConfigAccess(http.MethodGet, parts[0], nil, hash)
-		if err != nil {
-			return err
-		}
-
-		if hex.EncodeToString(hash.Sum(nil)) != parts[1] {
-			return APIError{
-				HTTPStatus: http.StatusPreconditionFailed,
-				Err:        fmt.Errorf("If-Match header did not match current config hash"),
+				Err:        fmt.Errorf("deleting the root configuration is not allowed; stop the server instead"),
 			}
 		}
 	}
 
+	// remember the config that is currently in effect so that any
+	// failure below restores the exact prior state instead of leaving
+	// a partially-mutated subtree behind
+	prevRawCfgJSON := rawCfgJSON
+	prevRawCfgIndex := rawCfgIndex
+	prevVersion := rawCfgVersion
+
+	restoreState := func() {
+		if prevRawCfgJSON != nil {
+			var oldCfg any
+			if err := json.Unmarshal(prevRawCfgJSON, &oldCfg); err != nil {
+				Log().Error("restoring previous config after failed change", zap.Error(err))
+				return
+			}
+			rawCfg[rawConfigKey] = oldCfg
+		} else {
+			rawCfg[rawConfigKey] = nil
+		}
+		rawCfgJSON = prevRawCfgJSON
+		rawCfgIndex = prevRawCfgIndex
+		rawCfgVersion = prevVersion
+	}
+
 	err := unsyncedConfigAccess(method, path, input, nil)
 	if err != nil {
-		return err
+		restoreState()
+		return "", asAPIError(err)
 	}
 
 	// the mutation is complete, so encode the entire config as JSON
 	newCfg, err := json.Marshal(rawCfg[rawConfigKey])
 	if err != nil {
-		return APIError{
+		restoreState()
+		return "", APIError{
 			HTTPStatus: http.StatusBadRequest,
 			Err:        fmt.Errorf("encoding new config: %v", err),
 		}
 	}
 
-	// if nothing changed, no need to do a whole reload unless the client forces it
+	// if nothing changed, no need to do a whole reload unless the client forces it;
+	// this is not a new version: the (unchanged) config keeps its token, which makes
+	// a retried submission idempotent rather than a second side effect
 	if !forceReload && bytes.Equal(rawCfgJSON, newCfg) {
 		Log().Info("config is unchanged")
-		return errSameConfig
+		return rawCfgVersion, errSameConfig
 	}
 
 	// find any IDs in this config and index them
 	idx := make(map[string]string)
 	err = indexConfigObjects(rawCfg[rawConfigKey], "/"+rawConfigKey, idx)
 	if err != nil {
-		if len(rawCfgJSON) > 0 {
-			var oldCfg any
-			err2 := json.Unmarshal(rawCfgJSON, &oldCfg)
-			if err2 != nil {
-				err = fmt.Errorf("%v; additionally, restoring old config: %v", err, err2)
-			}
-			rawCfg[rawConfigKey] = oldCfg
-		} else {
-			rawCfg[rawConfigKey] = nil
-		}
-		return APIError{
+		restoreState()
+		return "", APIError{
 			HTTPStatus: http.StatusBadRequest,
 			Err:        fmt.Errorf("indexing config: %v", err),
 		}
 	}
 
-	// load this new config; if it fails, we need to revert to
-	// our old representation of caddy's actual config
-	err = unsyncedDecodeAndRun(newCfg, true)
+	// mint the next token before changing anything at runtime, so a
+	// failure here still leaves the previous config fully in effect
+	newVersion, err := newConfigVersion()
 	if err != nil {
-		if len(rawCfgJSON) > 0 {
-			// restore old config state to keep it consistent
-			// with what caddy is still running; we need to
-			// unmarshal it again because it's likely that
-			// pointers deep in our rawCfg map were modified
-			var oldCfg any
-			err2 := json.Unmarshal(rawCfgJSON, &oldCfg)
-			if err2 != nil {
-				err = fmt.Errorf("%v; additionally, restoring old config: %v", err, err2)
-			}
-			rawCfg[rawConfigKey] = oldCfg
-		} else {
-			rawCfg[rawConfigKey] = nil
-		}
-
-		return fmt.Errorf("loading new config: %v", err)
+		restoreState()
+		return "", fmt.Errorf("generating config version token: %v", err)
 	}
 
-	// success, so update our stored copy of the encoded
-	// config to keep it consistent with what caddy is now
-	// running (storing an encoded copy is not strictly
-	// necessary, but avoids an extra json.Marshal for
-	// each config change)
+	// prepare and run this new config; if it fails, restore the prior
+	// state so what is exposed matches what Caddy is still running
+	if err = unsyncedDecodeAndRun(newCfg, true); err != nil {
+		restoreState()
+		return "", fmt.Errorf("loading new config: %v", err)
+	}
+
+	// success: commit raw state, index, and the pre-minted token
+	// atomically (relative to other config operations) so that
+	// subsequent requests only ever see the complete new config
+	// together with its new token
 	rawCfgJSON = newCfg
 	rawCfgIndex = idx
+	rawCfgVersion = newVersion
 
-	return nil
+	return newVersion, nil
 }
 
-// readConfig traverses the current config to path
-// and writes its JSON encoding to out.
-func readConfig(path string, out io.Writer) error {
+// readConfig traverses the current config to path and writes its JSON
+// encoding to out. It returns the opaque version token of the config
+// that was read; callers should hand that token back on their next
+// mutating request.
+func readConfig(path string, out io.Writer) (string, error) {
 	rawCfgMu.RLock()
 	defer rawCfgMu.RUnlock()
-	return unsyncedConfigAccess(http.MethodGet, path, nil, out)
+	err := unsyncedConfigAccess(http.MethodGet, path, nil, out)
+	if err != nil {
+		return "", err
+	}
+	return rawCfgVersion, nil
+}
+
+// asAPIError ensures errors caused by an invalid request (bad path,
+// type mismatch, out-of-bounds index) are reported as 4xx client
+// errors instead of falling through to a 500.
+func asAPIError(err error) error {
+	var apiErr APIError
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	return APIError{HTTPStatus: http.StatusBadRequest, Err: err}
+}
+
+// newConfigVersion generates an opaque, unguessable version token.
+// It is deliberately random rather than derived from the config:
+// identical successive configs must not share a token, so clients
+// cannot infer versions from content.
+func newConfigVersion() (string, error) {
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return "", err
+	}
+	return id.String(), nil
 }
 
 // indexConfigObjects recursively searches ptr for object fields named
@@ -620,7 +654,7 @@ func finishSettingUp(ctx Context, cfg *Config) error {
 
 		runLoadedConfig := func(config []byte) error {
 			logger.Info("applying dynamically-loaded config")
-			err := changeConfig(http.MethodPost, "/"+rawConfigKey, config, "", false)
+			_, err := changeConfig(http.MethodPost, "/"+rawConfigKey, config, "", false)
 			if errors.Is(err, errSameConfig) {
 				return err
 			}
@@ -706,6 +740,11 @@ func Stop() error {
 	rawCfgJSON = nil
 	rawCfgIndex = nil
 	rawCfg[rawConfigKey] = nil
+	// the empty state is a new generation: tokens handed out for
+	// the stopped config must not remain usable afterwards
+	if newVersion, err := newConfigVersion(); err == nil {
+		rawCfgVersion = newVersion
+	}
 	rawCfgMu.Unlock()
 
 	return nil
@@ -1229,10 +1268,35 @@ var (
 	// path, for converting /id/ paths to /config/ paths.
 	rawCfgIndex map[string]string
 
+	// rawCfgVersion is the opaque version token of the config
+	// currently in effect. It is replaced with a fresh random
+	// value every time a new config is committed and is never
+	// derived from the config contents, so it cannot be guessed
+	// from a config body. Protected by rawCfgMu.
+	rawCfgVersion = func() string {
+		id, err := uuid.NewRandom()
+		if err != nil {
+			// crypto/rand is required to function for the whole
+			// process to operate securely; failing here is fatal
+			panic(fmt.Sprintf("generating initial config version token: %v", err))
+		}
+		return id.String()
+	}()
+
 	// rawCfgMu protects all the rawCfg fields and also
 	// essentially synchronizes config changes/reloads.
 	rawCfgMu sync.RWMutex
 )
+
+// errConfigVersionMismatch is returned when a mutating config request
+// carries no version token, or a token that does not correspond to the
+// config currently in effect. It is deliberately distinct from errors
+// about the candidate config's contents (400) so callers can tell a
+// lost optimistic-concurrency race apart from a bad request.
+var errConfigVersionMismatch = APIError{
+	HTTPStatus: http.StatusPreconditionFailed,
+	Err:        errors.New("config version token is missing, stale, or does not match the current configuration"),
+}
 
 // lastConfigFile and lastConfigAdapter remember the source config
 // file and adapter used when Caddy was started via the CLI "run" command.

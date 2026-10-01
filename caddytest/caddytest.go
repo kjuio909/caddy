@@ -13,12 +13,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"path"
 	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 
 	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	// plug in Caddy modules here
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
@@ -62,6 +65,59 @@ type Tester struct {
 	configLoaded bool
 	t            testing.TB
 	config       Config
+
+	// configVersion is the opaque version token most recently observed
+	// from the admin API; it is attached to mutating /config/ and /id/
+	// requests automatically, mirroring what a read-modify-write client
+	// is expected to do.
+	configVersionMu sync.Mutex
+	configVersion   string
+}
+
+// adminConfigEndpoint reports whether uri targets the admin API's
+// configuration endpoints (including /id/ aliases).
+func adminConfigEndpoint(uri string) bool {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return false
+	}
+	p := u.Path
+	return p == "/config" || strings.HasPrefix(p, "/config/") ||
+		p == "/id" || strings.HasPrefix(p, "/id/")
+}
+
+// currentConfigVersion returns the most recently observed config
+// version token, fetching it from the admin API if necessary.
+func (tc *Tester) currentConfigVersion() string {
+	tc.configVersionMu.Lock()
+	token := tc.configVersion
+	tc.configVersionMu.Unlock()
+	if token != "" {
+		return token
+	}
+
+	resp, err := tc.Client.Get(fmt.Sprintf("http://localhost:%d/config/", tc.config.AdminPort))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	token = resp.Header.Get(caddy.ConfigVersionHeader)
+
+	tc.configVersionMu.Lock()
+	tc.configVersion = token
+	tc.configVersionMu.Unlock()
+	return token
+}
+
+// observeConfigVersion stores token if it is non-empty (a response only
+// carries the config version header for config endpoints).
+func (tc *Tester) observeConfigVersion(token string) {
+	if token == "" {
+		return
+	}
+	tc.configVersionMu.Lock()
+	tc.configVersion = token
+	tc.configVersionMu.Unlock()
 }
 
 // NewTester will create a new testing client with an attached cookie jar
@@ -506,10 +562,23 @@ func applyHeaders(t testing.TB, req *http.Request, requestHeaders []string) {
 func (tc *Tester) AssertResponseCode(req *http.Request, expectedStatusCode int) *http.Response {
 	tc.t.Helper()
 
+	// mutating requests against the configuration endpoints must carry
+	// the version token from the most recent read; attach the one this
+	// client has observed and track any newer token in the response
+	if req.Method != http.MethodGet && req.Method != http.MethodHead &&
+		adminConfigEndpoint(req.URL.String()) &&
+		req.Header.Get(caddy.ConfigVersionHeader) == "" {
+		if token := tc.currentConfigVersion(); token != "" {
+			req.Header.Set(caddy.ConfigVersionHeader, token)
+		}
+	}
+
 	resp, err := tc.Client.Do(req) //nolint:gosec // no SSRFs demonstrated
 	if err != nil {
 		tc.t.Fatalf("failed to call server %s", err)
 	}
+
+	tc.observeConfigVersion(resp.Header.Get(caddy.ConfigVersionHeader))
 
 	if expectedStatusCode != resp.StatusCode {
 		tc.t.Errorf("requesting \"%s\" expected status code: %d but got %d", req.URL.RequestURI(), expectedStatusCode, resp.StatusCode)
