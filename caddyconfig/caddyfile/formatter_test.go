@@ -188,9 +188,8 @@ d {
 			description: "comments",
 			input: `#a "\n"
 
- #b {
+ #b
 	c
-}
 
 d {
 e#f
@@ -201,9 +200,8 @@ h { # i
 }`,
 			expect: `#a "\n"
 
-#b {
+#b
 c
-}
 
 d {
 	e#f
@@ -255,27 +253,29 @@ j {
 }`,
 		},
 		{
-			description: "bad nesting (too many open)",
+			description: "bad nesting (too many open) is returned unchanged",
 			input: `a
 {
 	{
-}`,
-			expect: `a {
+}
+`,
+			expect: `a
+{
 	{
-	}
+}
 `,
 		},
 		{
-			description: "bad nesting (too many close)",
+			description: "bad nesting (too many close) is returned unchanged",
 			input: `a
 {
 	{
-}}}`,
-			expect: `a {
+}}}
+`,
+			expect: `a
+{
 	{
-	}
-}
-}
+}}}
 `,
 		},
 		{
