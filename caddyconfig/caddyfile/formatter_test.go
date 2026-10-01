@@ -24,6 +24,7 @@ func TestFormatter(t *testing.T) {
 		description string
 		input       string
 		expect      string
+		exact       bool // when true, expect must match byte for byte (no trailing newline is added)
 	}{
 		{
 			description: "very simple",
@@ -188,9 +189,8 @@ d {
 			description: "comments",
 			input: `#a "\n"
 
- #b {
+ #b {braces in comments stay literal}
 	c
-}
 
 d {
 e#f
@@ -201,9 +201,8 @@ h { # i
 }`,
 			expect: `#a "\n"
 
-#b {
+#b {braces in comments stay literal}
 c
-}
 
 d {
 	e#f
@@ -255,28 +254,28 @@ j {
 }`,
 		},
 		{
-			description: "bad nesting (too many open)",
+			description: "bad nesting (too many open) is returned unchanged",
 			input: `a
 {
 	{
 }`,
-			expect: `a {
+			expect: `a
+{
 	{
-	}
-`,
+}`,
+			exact: true,
 		},
 		{
-			description: "bad nesting (too many close)",
+			description: "bad nesting (too many close) is returned unchanged",
 			input: `a
 {
 	{
 }}}`,
-			expect: `a {
+			expect: `a
+{
 	{
-	}
-}
-}
-`,
+}}}`,
+			exact: true,
 		},
 		{
 			description: "json",
@@ -493,7 +492,7 @@ import ./conf.d/matcher_not_my_subnet.caddy
 	} {
 		// the formatter should output a trailing newline,
 		// even if the tests aren't written to expect that
-		if !strings.HasSuffix(tc.expect, "\n") {
+		if !tc.exact && !strings.HasSuffix(tc.expect, "\n") {
 			tc.expect += "\n"
 		}
 
